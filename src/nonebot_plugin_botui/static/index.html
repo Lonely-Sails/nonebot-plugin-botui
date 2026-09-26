@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-theme="dark">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark light">
+  <meta name="referrer" content="no-referrer">
+  <title>BotUI · 消息控制台</title>
+  <base href="./">
+  <link rel="stylesheet" href="./static/app.css">
+</head>
+<body>
+  <!-- 应用外壳：两栏布局，窄屏下由 JS 切换 data-pane 决定显示哪一栏 -->
+  <div class="app" id="app" data-pane="sidebar">
+
+    <!-- ============ 左侧边栏 ============ -->
+    <aside class="sidebar" id="sidebar">
+      <header class="sidebar-head">
+        <div class="sidebar-title-row">
+          <span class="brand">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <span class="brand-text">BotUI</span>
+          </span>
+          <button class="icon-btn" id="themeBtn" type="button" title="切换主题" aria-label="切换主题">
+            <svg class="ico-sun" viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.6v2.2M12 19.2v2.2M2.6 12h2.2M19.2 12h2.2M5.3 5.3l1.6 1.6M17.1 17.1l1.6 1.6M18.7 5.3l-1.6 1.6M6.9 17.1l-1.6 1.6"/></svg>
+            <svg class="ico-moon" viewBox="0 0 24 24" aria-hidden="true"><path d="M20 14.2A8.2 8.2 0 0 1 9.8 4 8.4 8.4 0 1 0 20 14.2z"/></svg>
+          </button>
+        </div>
+        <div class="search-wrap">
+          <svg class="search-ico" viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6.2"/><path d="M15.6 15.6L21 21"/></svg>
+          <input type="search" id="searchInput" class="search-input" placeholder="搜索会话 / 群号 / 消息" autocomplete="off" spellcheck="false" aria-label="搜索会话或消息">
+          <button class="search-clear" id="searchClear" type="button" aria-label="清空搜索" hidden>✕</button>
+        </div>
+        <div class="search-tabs" id="searchTabs" hidden role="tablist" aria-label="搜索范围">
+          <button class="search-tab active" id="tabChats" type="button" role="tab" aria-selected="true">会话</button>
+          <button class="search-tab" id="tabMsgs" type="button" role="tab" aria-selected="false">消息</button>
+        </div>
+      </header>
+
+      <div class="chat-list" id="chatList" role="list" aria-label="会话列表"></div>
+
+      <!-- 消息搜索结果：只在「消息」标签下显示，点一条直接跳到该会话并定位 -->
+      <div class="msg-results" id="msgResults" hidden role="list" aria-label="消息搜索结果"></div>
+
+      <footer class="sidebar-foot">
+        <div class="conn-row">
+          <span class="dot dot-idle" id="connDot" aria-hidden="true"></span>
+          <span class="conn-text" id="connText">正在连接…</span>
+        </div>
+        <div class="conn-meta" id="connMeta"></div>
+      </footer>
+    </aside>
+
+    <!-- ============ 右侧会话区 ============ -->
+    <main class="chat-pane" id="chatPane">
+      <header class="chat-head" id="chatHead">
+        <button class="icon-btn back-btn" id="backBtn" type="button" title="返回会话列表" aria-label="返回会话列表">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 5l-7 7 7 7"/></svg>
+        </button>
+        <div class="head-avatar" id="headAvatar"></div>
+        <div class="head-main">
+          <div class="head-name-row">
+            <span class="head-name" id="headName">未选择会话</span>
+            <span class="badge" id="headKind" hidden></span>
+          </div>
+          <div class="head-sub" id="headSub">从左侧选择一个会话开始查看消息</div>
+        </div>
+        <button class="icon-btn" id="reloadBtn" type="button" title="重新加载消息" aria-label="重新加载消息">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20.2 4.4v4.2H16"/></svg>
+        </button>
+      </header>
+
+      <div class="msg-area">
+        <div class="msg-viewport" id="msgViewport">
+          <div class="msg-list" id="msgList"></div>
+        </div>
+        <button class="new-msg-btn" id="newMsgBtn" type="button" hidden></button>
+      </div>
+
+      <footer class="composer" id="composer">
+        <div class="composer-bar" id="replyBar" hidden>
+          <span class="bar-label" id="replyBarLabel"></span>
+          <button class="bar-close" id="replyBarClose" type="button" aria-label="取消回复">✕</button>
+        </div>
+        <div class="pending-at" id="pendingAt" hidden></div>
+        <div class="composer-row">
+          <button class="composer-tool" id="atBtn" type="button" title="提及成员（@）">@</button>
+          <textarea id="composerInput" class="composer-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" aria-label="消息输入框"></textarea>
+          <button class="send-btn" id="sendBtn" type="button">发送</button>
+        </div>
+        <div class="composer-hint" id="composerHint"></div>
+      </footer>
+    </main>
+  </div>
+
+  <!-- 图片灯箱：点击图片查看大图，点击任意处或 Esc 关闭 -->
+  <div class="lightbox" id="lightbox" hidden>
+    <img id="lightboxImg" alt="图片预览">
+    <div class="lightbox-tip">点击任意位置或按 Esc 关闭</div>
+  </div>
+
+  <!-- 消息右键菜单 -->
+  <div class="ctx-menu" id="ctxMenu" hidden role="menu"></div>
+
+  <!-- @ 成员选择菜单：列出该会话记录到过的成员，供点选 -->
+  <div class="at-menu" id="atMenu" hidden role="menu" tabindex="-1" aria-label="选择要提及的成员"></div>
+
+  <!-- 令牌输入页：仅在需要鉴权且本地无令牌时显示 -->
+  <div class="gate" id="gate" hidden>
+    <div class="gate-card">
+      <div class="gate-logo" aria-hidden="true"></div>
+      <h1 class="gate-title">BotUI 消息控制台</h1>
+      <p class="gate-desc" id="gateDesc">该服务已开启访问令牌校验，请输入令牌后继续。</p>
+      <form class="gate-form" id="gateForm" autocomplete="off">
+        <input type="password" class="gate-input" id="gateInput" placeholder="请输入访问令牌" autocomplete="off" spellcheck="false" aria-label="访问令牌">
+        <button type="submit" class="gate-submit" id="gateSubmit">保存</button>
+      </form>
+      <p class="gate-tip">令牌仅保存在当前浏览器的 localStorage 中</p>
+    </div>
+  </div>
+
+  <!-- 轻量提示条 -->
+  <div class="toast" id="toast" hidden></div>
+
+  <script src="./static/app.js"></script>
+</body>
+</html>
