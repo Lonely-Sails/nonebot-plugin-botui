@@ -849,6 +849,44 @@ class MessageStore:
         items.reverse()
         return items
 
+    async def stream_messages(
+        self,
+        key: str,
+        limit: int = 2000,
+        after: float | None = None,
+        after_id: int | None = None,
+    ) -> list[MessageRecord]:
+        """按时间正序返回某会话的消息，用于「导出聊天记录」。
+
+        与 :meth:`messages` 的区别是方向相反：这边从最早开始向后取，供导出时
+        按顺序写入；``after`` / ``after_id`` 用于分批继续取下一页。
+        """
+        if self._db is None:
+            return []
+        limit = max(1, min(2000, int(limit)))
+        if after is None:
+            sql = (
+                'SELECT * FROM messages WHERE chat_key = ? AND recalled = 0 '
+                'ORDER BY ts ASC, id ASC LIMIT ?'
+            )
+            params: tuple[Any, ...] = (key, limit)
+        elif after_id is None:
+            sql = (
+                'SELECT * FROM messages WHERE chat_key = ? AND recalled = 0 '
+                'AND ts > ? ORDER BY ts ASC, id ASC LIMIT ?'
+            )
+            params = (key, after, limit)
+        else:
+            sql = (
+                'SELECT * FROM messages WHERE chat_key = ? AND recalled = 0 '
+                'AND (ts > ? OR (ts = ? AND id > ?)) '
+                'ORDER BY ts ASC, id ASC LIMIT ?'
+            )
+            params = (key, after, after, after_id, limit)
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        return [self._row_to_message(r) for r in rows]
+
     async def search(
         self,
         keyword: str,
@@ -898,6 +936,41 @@ class MessageStore:
         ) as cur:
             row = await cur.fetchone()
         return self._row_to_message(row) if row else None
+
+    async def forward_nodes(
+        self, key: str | None, forward_id: str
+    ) -> list[dict[str, Any]]:
+        """在已记录的消息里找某条合并转发内联的节点。
+
+        有些适配器（Satori 等）把转发内容直接放在段里，那就无需再调接口。
+        只扫最近的一批消息：转发内容只在原消息附近可查，全表扫描不划算。
+        """
+        if self._db is None or not forward_id:
+            return []
+        if key:
+            sql = (
+                'SELECT segments FROM messages WHERE chat_key = ? AND recalled = 0 '
+                'ORDER BY id DESC LIMIT 200'
+            )
+            params: tuple[Any, ...] = (key,)
+        else:
+            sql = (
+                'SELECT segments FROM messages WHERE recalled = 0 '
+                'ORDER BY id DESC LIMIT 200'
+            )
+            params = ()
+        async with self._db.execute(sql, params) as cur:
+            rows = await cur.fetchall()
+        for row in rows:
+            for seg in _safe_json(row['segments']):
+                if not isinstance(seg, dict) or seg.get('type') != 'forward':
+                    continue
+                if str(seg.get('id') or '') != str(forward_id):
+                    continue
+                nodes = seg.get('nodes')
+                if isinstance(nodes, list) and nodes:
+                    return nodes
+        return []
 
     async def message_by_message_id(self, message_id: str) -> MessageRecord | None:
         """按适配器的消息 ID 反查记录（用于给「回复」补上被引用内容）"""

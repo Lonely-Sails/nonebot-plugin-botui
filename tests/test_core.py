@@ -236,6 +236,130 @@ def test_describe_segments_labels_new_types():
     assert describe_segments([{'type': 'button'}]) == '[按钮]'
 
 
+def test_forward_segment_fallback_keeps_id():
+    """兜底路径遇到 forward 段要保留 id，而不是当成未知段丢掉。"""
+    from nonebot_plugin_botui.segments import _fallback_segments
+
+    segments = _fallback_segments([{'type': 'forward', 'data': {'id': 'fwd-9'}}])
+    assert segments[0]['type'] == 'forward'
+    assert segments[0]['id'] == 'fwd-9'
+
+
+def test_parse_forward_nodes_from_get_forward_msg():
+    """``get_forward_msg`` 的返回值要能展开成统一的节点列表。"""
+    from nonebot_plugin_botui.segments import parse_forward_nodes
+
+    payload = {
+        'messages': [
+            {
+                'type': 'node',
+                'data': {
+                    'user_id': '10001',
+                    'nickname': '小明',
+                    'time': 1700000000,
+                    'content': [{'type': 'text', 'data': {'text': '第一句'}}],
+                },
+            },
+            {
+                'type': 'node',
+                'data': {
+                    'user_id': '10002',
+                    'nickname': '小红',
+                    'time': 1700000001,
+                    'content': [
+                        {'type': 'image', 'data': {'url': 'http://e/a.png'}},
+                        {'type': 'text', 'data': {'text': '看图'}},
+                    ],
+                },
+            },
+        ]
+    }
+    nodes = parse_forward_nodes(payload)
+    assert len(nodes) == 2
+    assert nodes[0]['name'] == '小明'
+    assert nodes[0]['user_id'] == '10001'
+    assert nodes[0]['time'] == 1700000000.0
+    assert nodes[0]['segments'] == [{'type': 'text', 'text': '第一句'}]
+    # 第二条里的图片段也要能转出来（展开后仍可预览）
+    assert [s['type'] for s in nodes[1]['segments']] == ['image', 'text']
+
+
+def test_parse_forward_nodes_accepts_plain_dict_and_list():
+    """直接是单个节点 dict，或节点列表，都要能展开（不同适配器形状不一）。"""
+    from nonebot_plugin_botui.segments import parse_forward_nodes
+
+    single = parse_forward_nodes(
+        {'nickname': '小明', 'content': [{'type': 'text', 'data': {'text': 'hi'}}]}
+    )
+    assert len(single) == 1
+    assert single[0]['segments'] == [{'type': 'text', 'text': 'hi'}]
+
+    listed = parse_forward_nodes(
+        [
+            {'nickname': 'A', 'message': [{'type': 'text', 'data': {'text': 'a'}}]},
+            {'nickname': 'B', 'message': [{'type': 'text', 'data': {'text': 'b'}}]},
+        ]
+    )
+    assert [n['name'] for n in listed] == ['A', 'B']
+
+
+def test_parse_forward_nodes_handles_garbage():
+    """认不出的输入返回空列表，不能抛异常。"""
+    from nonebot_plugin_botui.segments import parse_forward_nodes
+
+    assert parse_forward_nodes(None) == []
+    assert parse_forward_nodes(12345) == []
+    assert parse_forward_nodes({'unexpected': 'shape'}) == []
+
+
+def test_fallback_segments_accepts_dict_segments():
+    """兜底路径要同时认适配器段对象与纯 dict（call_api 结果常是 dict）。"""
+    from nonebot_plugin_botui.segments import _fallback_segments
+
+    single = _fallback_segments({'type': 'text', 'data': {'text': '你好'}})
+    assert single == [{'type': 'text', 'text': '你好'}]
+
+    mixed = _fallback_segments(
+        [
+            {'type': 'text', 'data': {'text': 'a'}},
+            {
+                'type': 'image',
+                'data': {'url': 'http://e/b.png', 'file': 'b.png'},
+            },
+        ]
+    )
+    assert [s['type'] for s in mixed] == ['text', 'image']
+    assert mixed[1]['url'] == 'http://e/b.png'
+
+
+def test_media_helpers_classify_and_decode():
+    """文本判定与解码要覆盖常见类型 / 编码。"""
+    from nonebot_plugin_botui.media import is_textual, decode_text
+
+    assert is_textual('text/plain')
+    assert is_textual('application/json')
+    assert is_textual('application/octet-stream', 'notes.md')
+    assert is_textual('application/octet-stream', 'http://e/a/b.py')
+    assert not is_textual('image/png', 'a.png')
+    assert not is_textual('application/zip', 'a.zip')
+
+    assert decode_text('中文'.encode())[0] == '中文'
+    assert decode_text('中文'.encode('gb18030'))[0] == '中文'
+    # 带 BOM 的 UTF-16 走 BOM 分支
+    assert decode_text('中文'.encode('utf-16'))[0] == '中文'
+    # 二进制乱码也不能抛异常
+    assert isinstance(decode_text(bytes([0xFF, 0xFE, 0x00, 0x01]))[0], str)
+
+
+def test_media_total_bytes_parsing():
+    """总字节数优先看 Content-Range，其次 Content-Length。"""
+    from nonebot_plugin_botui.media import _total_bytes
+
+    assert _total_bytes({'content-range': 'bytes 0-511/1048576'}) == 1048576
+    assert _total_bytes({'content-length': '2048'}) == 2048
+    assert _total_bytes({}) == 0
+
+
 def test_config_route_normalization():
     from nonebot_plugin_botui.config import Config
 

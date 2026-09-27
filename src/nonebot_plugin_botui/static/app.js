@@ -21,6 +21,8 @@
 
 // 由文档基址推导接口前缀：即使路由前缀变化也无需改代码
 const API_BASE = new URL('api/', document.baseURI).href.replace(/\/$/, '');
+// 插件路由根（/media、/api/file 这些不在 /api 下）
+const ROOT_BASE = new URL('./', document.baseURI).href.replace(/\/$/, '');
 
 const TOKEN_KEY = 'botui_token';
 const THEME_KEY = 'botui_theme';
@@ -36,6 +38,8 @@ const NEAR_BOTTOM = 80;     // 距底部多少像素内算“贴着底部”
 
 const state = {
   meta: null,               // /meta 结果
+  l: '',                    // 占位（未使用）
+  l: '',                    // 占位（未使用）
   token: '',                // 访问令牌
   gateOpen: false,          // 令牌页是否显示
   gateFrom401: false,       // 令牌页是否由 401 触发
@@ -53,6 +57,12 @@ const state = {
   hasMore: true,            // 是否还有更早的消息
   loadingMore: false,       // 是否正在加载更早的消息
   needsScroll: false,       // 渲染后是否需要滚到底部
+
+  fileSeq: 0,               // 文件预览请求序号（丢弃过期结果）
+  forwardSeq: 0,            // 合并转发展开请求序号
+
+  unread: new Map(),        // 会话 key -> 未读数
+  pending: new Map(),       // 会话 key -> 未读消息摘要
 
   unread: new Map(),        // 会话 key -> 未读数
   pending: new Map(),       // 会话 key -> 未读消息摘要
@@ -128,6 +138,12 @@ const el = {
   hint: $('composerHint'),
   lightbox: $('lightbox'),
   lightboxImg: $('lightboxImg'),
+  fileViewer: $('fileViewer'),
+  fileViewerTitle: $('fileViewerTitle'),
+  fileViewerMeta: $('fileViewerMeta'),
+  fileViewerBody: $('fileViewerBody'),
+  fileViewerClose: $('fileViewerClose'),
+  fileViewerSave: $('fileViewerSave'),
   ctxMenu: $('ctxMenu'),
   gate: $('gate'),
   gateForm: $('gateForm'),
@@ -151,6 +167,31 @@ function safeUrl(url) {
   if (typeof url !== 'string') return '';
   const trimmed = url.trim();
   return /^https?:\/\//i.test(trimmed) ? trimmed : '';
+}
+
+/** 鉴权参数：图片/文件走 <img>/<a>/<audio> 直接发请求，带不上自定义请求头 */
+function authQuery() {
+  return state.token ? '&token=' + encodeURIComponent(state.token) : '';
+}
+
+/** 媒体代理地址：远程图片大多带防盗链，直连会加载失败，统一走后端代理 */
+function proxied(raw) {
+  const url = safeUrl(raw);
+  if (!url) return '';
+  return ROOT_BASE + '/media?u=' + encodeURIComponent(url) + authQuery();
+}
+
+/** 文件地址：走 /api/file 代理（QQ 文件直链往往需要鉴权，且要支持 Range） */
+function fileUrl(raw, name, download) {
+  const url = safeUrl(raw);
+  const parts = [];
+  if (url) parts.push('u=' + encodeURIComponent(url));
+  if (hasText(name)) parts.push('name=' + encodeURIComponent(String(name)));
+  if (state.current && hasText(state.current.key)) {
+    parts.push('chat=' + encodeURIComponent(String(state.current.key)));
+  }
+  if (download) parts.push('download=1');
+  return ROOT_BASE + '/api/file?' + parts.join('&') + authQuery();
 }
 
 function parseTime(value) {
@@ -1146,13 +1187,13 @@ function buildBubble(segments) {
         return;
       }
       case 'voice':
-        bubble.appendChild(placeholderChip('语音', seg.url));
+        bubble.appendChild(buildMediaPlayer(seg, 'voice'));
         return;
       case 'audio':
-        bubble.appendChild(placeholderChip('音频', seg.url));
+        bubble.appendChild(buildMediaPlayer(seg, 'audio'));
         return;
       case 'video':
-        bubble.appendChild(placeholderChip('视频', seg.url));
+        bubble.appendChild(buildMediaPlayer(seg, 'video'));
         return;
       case 'button': {
         const label = hasText(seg.label) ? String(seg.label) : '[按钮]';
@@ -1167,14 +1208,11 @@ function buildBubble(segments) {
         return;
       }
       case 'file': {
-        const chip = h('span', 'chip');
-        chip.appendChild(h('span', null, '[文件] ' + (hasText(seg.name) ? String(seg.name) : '未命名文件')));
-        const link = safeUrl(seg.url);
-        if (link) {
-          chip.appendChild(externalLink(link, '下载'));
-          chip.classList.add('clickable');
-        }
-        bubble.appendChild(chip);
+        bubble.appendChild(buildFileCard(seg));
+        return;
+      }
+      case 'forward': {
+        bubble.appendChild(buildForwardCard(seg));
         return;
       }
       case 'json': {
@@ -1227,12 +1265,160 @@ function placeholderChip(label, url) {
   const chip = h('span', 'chip');
   chip.appendChild(h('span', null, '[' + label + ']'));
   if (link) {
-    chip.appendChild(externalLink(link, '打开'));
+    chip.appendChild(externalLink(proxied(url), '打开'));
     chip.classList.add('clickable');
   } else {
     chip.appendChild(h('span', null, '暂不支持播放'));
   }
   return chip;
+}
+
+/**
+ * 音视频内联播放器。
+ *
+ * QQ 的语音/视频链接同样有防盗链，所以 src 统一走后端 /media 代理；代理
+ * 支持 Range，拖动进度条也不会整段重下。拿不到链接时退化成占位标签。
+ */
+function buildMediaPlayer(seg, kind) {
+  const label = kind === 'voice' ? '语音' : (kind === 'audio' ? '音频' : '视频');
+  const tags = {
+    voice: 'audio', audio: 'audio', video: 'video'
+  };
+  const duration = Number(seg.duration);
+  const suffix = Number.isFinite(duration) && duration > 0 ? '（' + Math.round(duration) + 's）' : '';
+
+  const source = safeUrl(seg.url);
+  if (!source) {
+    const chip = h('span', 'chip');
+    chip.appendChild(h('span', null, '[' + label + suffix + ']'));
+    chip.appendChild(h('span', null, '暂不支持播放'));
+    return chip;
+  }
+
+  const wrap = h('span', 'seg-block seg-media');
+  const player = document.createElement(tags[kind] || 'audio');
+  player.className = 'seg-player' + (kind === 'video' ? ' seg-video' : '');
+  player.controls = true;
+  player.preload = 'metadata';
+  if (kind === 'video') player.playsInline = true;
+  player.src = proxied(seg.url);
+  player.addEventListener('error', () => {
+    if (!player.parentNode) return;
+    const fallback = placeholderChip(label + suffix, seg.url);
+    player.parentNode.replaceChild(fallback, player);
+  });
+  wrap.appendChild(player);
+  return wrap;
+}
+
+function fileExt(name) {
+  const text = hasText(name) ? String(name).trim() : '';
+  const dot = text.lastIndexOf('.');
+  return dot >= 0 && dot < text.length - 1 ? text.slice(dot + 1).toLowerCase() : '';
+}
+
+/** 按扩展名给文件卡片一个可读的类别名（界面上显示为图标文字） */
+function fileKind(name, mime) {
+  const ext = fileExt(name);
+  const byExt = {
+    png: '图片', jpg: '图片', jpeg: '图片', gif: '图片', webp: '图片', bmp: '图片',
+    svg: '图片', ico: '图片',
+    pdf: 'PDF',
+    txt: '文本', md: '文本', log: '文本', json: '文本', xml: '文本', yaml: '文本',
+    yml: '文本', toml: '文本', ini: '文本', csv: '文本', py: '文本', js: '文本',
+    ts: '文本', java: '文本', go: '文本', rs: '文本', c: '文本', cpp: '文本',
+    h: '文本', sh: '文本', html: '文本', css: '文本', sql: '文本', vue: '文本',
+    mp3: '音频', wav: '音频', flac: '音频', m4a: '音频', ogg: '音频', amr: '音频',
+    mp4: '视频', mov: '视频', mkv: '视频', webm: '视频', avi: '视频',
+    zip: '压缩包', rar: '压缩包', '7z': '压缩包', tar: '压缩包', gz: '压缩包',
+    doc: '文档', docx: '文档', xls: '表格', xlsx: '表格', ppt: '演示', pptx: '演示',
+    exe: '程序', apk: '安装包', dmg: '安装包'
+  };
+  if (byExt[ext]) return byExt[ext];
+  const type = String(mime || '').toLowerCase();
+  if (type.startsWith('image/')) return '图片';
+  if (type.startsWith('audio/')) return '音频';
+  if (type.startsWith('video/')) return '视频';
+  if (type === 'application/pdf') return 'PDF';
+  return '文件';
+}
+
+/** 判断能否在线预览，以及用哪种方式预览 */
+function previewKind(name, mime) {
+  const ext = fileExt(name);
+  const type = String(mime || '').toLowerCase();
+  if (type === 'application/pdf' || ext === 'pdf') return 'pdf';
+  if (type.startsWith('image/') || ['png', 'jpg', 'jpeg', 'gif', 'webp', 'bmp', 'svg', 'ico'].indexOf(ext) >= 0) return 'image';
+  if (type.startsWith('audio/') || ['mp3', 'wav', 'flac', 'm4a', 'ogg', 'amr'].indexOf(ext) >= 0) return 'audio';
+  if (type.startsWith('video/') || ['mp4', 'mov', 'mkv', 'webm', 'avi'].indexOf(ext) >= 0) return 'video';
+  if (type.startsWith('text/') || type === 'application/json' || type === 'application/xml') return 'text';
+  if (ext && TEXT_EXTS.indexOf(ext) >= 0) return 'text';
+  return '';
+}
+
+const TEXT_EXTS = [
+  'txt', 'md', 'markdown', 'log', 'json', 'jsonl', 'xml', 'yaml', 'yml', 'toml',
+  'ini', 'cfg', 'conf', 'csv', 'tsv', 'env', 'py', 'js', 'mjs', 'cjs', 'ts',
+  'tsx', 'jsx', 'java', 'kt', 'go', 'rs', 'c', 'h', 'cpp', 'hpp', 'cs', 'rb',
+  'php', 'sh', 'bash', 'zsh', 'fish', 'ps1', 'bat', 'cmd', 'lua', 'sql', 'html',
+  'htm', 'css', 'scss', 'less', 'vue', 'svelte', 'patch', 'diff', 'srt', 'vtt'
+];
+
+/** 文件卡片：类别图标 + 文件名 + 新窗口预览 / 下载 */
+function buildFileCard(seg) {
+  const name = hasText(seg.name) ? String(seg.name) : '未命名文件';
+  const source = safeUrl(seg.url);
+  const card = h('span', 'chip seg-file');
+
+  card.appendChild(h('span', 'file-badge', fileKind(name)));
+  const main = h('span', 'file-main');
+  main.appendChild(h('span', 'file-name', name));
+  const size = Number(seg.size);
+  if (Number.isFinite(size) && size > 0) {
+    main.appendChild(h('span', 'file-size', formatBytes(size)));
+  }
+  card.appendChild(main);
+
+  if (!source) {
+    card.appendChild(h('span', 'file-hint', '无直链'));
+    return card;
+  }
+
+  const canPreview = previewKind(name, seg.mime) && (!state.meta || state.meta.file_preview !== false);
+  if (canPreview) {
+    const btn = h('button', 'file-btn', '预览');
+    btn.type = 'button';
+    btn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openFilePreview(seg);
+    });
+    card.appendChild(btn);
+    card.classList.add('clickable');
+  }
+  const link = externalLink(fileUrl(seg.url, name, true), '下载');
+  link.className = 'file-btn';
+  card.appendChild(link);
+  return card;
+}
+
+function formatBytes(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let size = n;
+  let i = 0;
+  while (size >= 1024 && i < units.length - 1) { size /= 1024; i += 1; }
+  return (i === 0 ? String(size) : size.toFixed(1)) + ' ' + units[i];
+}
+
+/** 合并转发卡片：点击展开查看里面的消息 */
+function buildForwardCard(seg) {
+  const count = Number(seg.count);
+  const label = '[合并转发]' + (Number.isFinite(count) && count > 0 ? '（' + count + ' 条）' : '');
+  const card = h('span', 'chip seg-forward clickable', label);
+  card.title = '点击展开查看转发内容';
+  if (hasText(seg.id)) card.dataset.forwardId = String(seg.id);
+  return card;
 }
 
 function externalLink(href, text) {
@@ -1245,7 +1431,8 @@ function externalLink(href, text) {
 
 function buildImage(seg) {
   const wrap = h('span', 'seg-block');
-  const url = safeUrl(seg.url);
+  const source = safeUrl(seg.url);
+  const url = proxied(seg.url);
   if (!url) {
     wrap.appendChild(h('span', 'chip seg-unknown', '[图片] ' + (hasText(seg.file) ? String(seg.file) : '无法加载')));
     return wrap;
@@ -1258,11 +1445,13 @@ function buildImage(seg) {
   img.alt = hasText(seg.name) ? String(seg.name) : (hasText(seg.file) ? String(seg.file) : '图片');
   img.src = url;
   img.addEventListener('error', () => {
-    if (img.parentNode) img.parentNode.replaceChild(h('span', 'img-fallback', '图片加载失败'), img);
+    if (img.parentNode) {
+      img.parentNode.replaceChild(h('span', 'img-fallback', '图片加载失败'), img);
+    }
   });
   img.addEventListener('click', (ev) => {
     ev.stopPropagation();
-    openLightbox(url);
+    openLightbox(source);
   });
   wrap.appendChild(img);
   return wrap;
@@ -1761,7 +1950,7 @@ function autoGrow() {
 /* ============================ 9. 灯箱与右键菜单 ============================ */
 
 function openLightbox(url) {
-  const link = safeUrl(url);
+  const link = proxied(url) || safeUrl(url);
   if (!link) return;
   el.lightboxImg.src = link;
   el.lightbox.hidden = false;
@@ -1773,6 +1962,155 @@ function closeLightbox() {
   el.lightboxImg.removeAttribute('src');
 }
 
+/* ---------- 文件在线预览弹窗 ----------
+   文本类直接展示内容，图片 / PDF / 音视频用内嵌元素。所有资源都走
+   /api/file 代理，既能绕过防盗链，也能通过令牌。 */
+
+function openFileViewer(title, meta) {
+  el.fileViewerTitle.textContent = title || '文件预览';
+  el.fileViewerMeta.textContent = meta || '';
+  el.fileViewerBody.textContent = '';
+  el.fileViewer.hidden = false;
+}
+
+function closeFileViewer() {
+  if (el.fileViewer.hidden) return;
+  el.fileViewer.hidden = true;
+  el.fileViewerBody.textContent = '';
+  el.fileViewerSave.removeAttribute('href');
+}
+
+async function openFilePreview(seg) {
+  const name = hasText(seg.name) ? String(seg.name) : '未命名文件';
+  const kind = previewKind(name, seg.mime);
+  if (!kind) { toast('该文件类型不支持预览', true); return; }
+  if (state.meta && state.meta.file_preview === false) {
+    toast('未开启文件在线预览', true);
+    return;
+  }
+
+  const save = fileUrl(seg.url, name, true);
+  el.fileViewerSave.href = save;
+  el.fileViewerSave.setAttribute('download', name);
+
+  if (kind === 'text') {
+    const seq = ++state.fileSeq;
+    openFileViewer(name, '正在读取内容…');
+    const box = h('pre', 'file-text', '');
+    el.fileViewerBody.appendChild(box);
+    try {
+      const query = 'name=' + encodeURIComponent(name)
+        + '&u=' + encodeURIComponent(safeUrl(seg.url) || String(seg.url || ''))
+        + (state.current && state.current.key ? '&chat=' + encodeURIComponent(state.current.key) : '');
+      const data = await api('/preview?' + query);
+      if (seq !== state.fileSeq || el.fileViewer.hidden) return;
+      box.textContent = data && typeof data.text === 'string' ? data.text : '';
+      const parts = [];
+      if (hasText(data && data.content_type)) parts.push(String(data.content_type));
+      if (Number.isFinite(Number(data && data.bytes)) && Number(data.bytes) > 0) {
+        parts.push(formatBytes(Number(data.bytes)));
+      }
+      if (data && data.truncated) parts.push('仅显示前 512 KB');
+      el.fileViewerMeta.textContent = parts.join(' · ');
+    } catch (err) {
+      if (seq !== state.fileSeq) return;
+      box.textContent = '';
+      el.fileViewerBody.textContent = '';
+      el.fileViewerBody.appendChild(emptyState('无法预览', (err && err.message) ? err.message : '读取失败'));
+      el.fileViewerMeta.textContent = '';
+    }
+    return;
+  }
+
+  const url = fileUrl(seg.url, name, false);
+  const size = formatBytes(Number(seg.size));
+  openFileViewer(name, [fileKind(name, seg.mime), size].filter(hasText).join(' · '));
+
+  if (kind === 'image') {
+    const img = document.createElement('img');
+    img.className = 'file-image';
+    img.alt = name;
+    img.src = url;
+    img.addEventListener('error', () => {
+      el.fileViewerBody.textContent = '';
+      el.fileViewerBody.appendChild(emptyState('图片加载失败', '可尝试直接下载'));
+    });
+    el.fileViewerBody.appendChild(img);
+    return;
+  }
+  if (kind === 'pdf') {
+    const frame = document.createElement('iframe');
+    frame.className = 'file-frame';
+    frame.src = url;
+    frame.title = name;
+    el.fileViewerBody.appendChild(frame);
+    return;
+  }
+  const tag = kind === 'video' ? 'video' : 'audio';
+  const media = document.createElement(tag);
+  media.className = 'file-media';
+  media.controls = true;
+  media.src = url;
+  if (tag === 'video') media.playsInline = true;
+  el.fileViewerBody.appendChild(media);
+}
+
+/** 展开合并转发：优先用记录里内联的节点，否则请后端调适配器接口 */
+function openForwardPreview(seg) {
+  const id = hasText(seg.id) ? String(seg.id) : '';
+  if (!id) { toast('这条合并转发没有可用的 ID，无法展开', true); return; }
+  const box = h('div', 'forward-list');
+  const nodes = Array.isArray(seg.nodes) ? seg.nodes : [];
+  if (nodes.length) {
+    renderForwardNodes(box, nodes);
+    openFileViewer('合并转发（' + nodes.length + ' 条）', '');
+    el.fileViewerBody.appendChild(box);
+    return;
+  }
+
+  const seq = ++state.forwardSeq;
+  const loading = h('div', 'forward-hint', '正在展开…');
+  box.appendChild(loading);
+  openFileViewer('合并转发', '');
+  el.fileViewerBody.appendChild(box);
+  (async () => {
+    try {
+      const query = 'id=' + encodeURIComponent(id)
+        + (state.current && state.current.key ? '&chat=' + encodeURIComponent(state.current.key) : '');
+      const data = await api('/forward?' + query);
+      if (seq !== state.forwardSeq || el.fileViewer.hidden) return;
+      box.textContent = '';
+      const list = data && Array.isArray(data.nodes) ? data.nodes : [];
+      if (!list.length) {
+        box.appendChild(emptyState('没有内容', '这条合并转发是空的'));
+        return;
+      }
+      el.fileViewerTitle.textContent = '合并转发（' + list.length + ' 条）';
+      renderForwardNodes(box, list);
+    } catch (err) {
+      if (seq !== state.forwardSeq) return;
+      box.textContent = '';
+      box.appendChild(emptyState('无法展开', (err && err.message) ? err.message : '请求失败'));
+    }
+  })();
+}
+
+function renderForwardNodes(box, nodes) {
+  nodes.forEach((node) => {
+    const row = h('div', 'forward-node');
+    const head = h('div', 'forward-node-head');
+    head.appendChild(h('span', 'forward-node-name', hasText(node.name) ? String(node.name) : (hasText(node.user_id) ? String(node.user_id) : '未知')));
+    const t = parseTime(node.time);
+    if (t !== null) head.appendChild(h('span', 'forward-node-time', fullTime(t)));
+    row.appendChild(head);
+    const segs = Array.isArray(node.segments) ? node.segments : [];
+    const body = h('div', 'forward-node-body');
+    body.appendChild(buildBubble(segs.length ? segs : [{ type: 'text', text: '[空消息]' }]));
+    row.appendChild(body);
+    box.appendChild(row);
+  });
+}
+
 function openCtxMenu(x, y, msg) {
   state.ctxMsg = msg;
   const menu = el.ctxMenu;
@@ -1780,12 +2118,17 @@ function openCtxMenu(x, y, msg) {
 
   const capability = state.meta && state.meta.capabilities ? state.meta.capabilities.recall !== false : true;
   const recallable = msg.recallable === true && capability;
+  const fileSeg = firstFileSeg(msg);
+  const previewable = fileSeg && previewKind(fileSeg.name, fileSeg.mime)
+    && (!state.meta || state.meta.file_preview !== false);
 
   const items = [
     { label: '复制文本', run: () => copyText(hasText(msg.text) ? msg.text : previewOf(msg)) },
     { label: '回复', run: () => setReply(msg) },
+    { label: '预览文件', run: () => openFilePreview(fileSeg), disabled: !previewable },
     { label: '撤回', run: () => recallMessage(msg), disabled: !recallable, danger: true },
     { sep: true },
+    { label: '导出聊天记录', run: () => exportChat() },
     { label: '复制消息ID', run: () => copyText(hasText(msg.message_id) ? msg.message_id : msg.id) }
   ];
 
@@ -1847,6 +2190,45 @@ function removeMessage(id) {
 function cssEscape(value) {
   if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(String(value));
   return String(value).replace(/["\\]/g, '\\$&');
+}
+
+/** 在一条已加载的消息里找出指定 id 的合并转发段（拿 segment 上的内联节点） */
+function findForwardSeg(msg, forwardId) {
+  if (!msg || !Array.isArray(msg.segments)) return null;
+  const wanted = String(forwardId || '');
+  for (let i = 0; i < msg.segments.length; i++) {
+    const seg = msg.segments[i];
+    if (seg && seg.type === 'forward' && String(seg.id || '') === wanted) return seg;
+  }
+  return null;
+}
+
+/** 取出消息里第一个带可用链接的文件段（用于右键菜单的“预览文件”） */
+function firstFileSeg(msg) {
+  if (!msg || !Array.isArray(msg.segments)) return null;
+  for (let i = 0; i < msg.segments.length; i++) {
+    const seg = msg.segments[i];
+    if (!seg) continue;
+    if ((seg.type === 'file' || seg.type === 'video' || seg.type === 'audio' || seg.type === 'voice') && hasText(seg.url)) {
+      return seg;
+    }
+  }
+  return null;
+}
+
+/** 导出当前会话的聊天记录（后端直接返回 JSON 附件） */
+function exportChat() {
+  const chat = state.current;
+  if (!chat) { toast('请先选择一个会话', true); return; }
+  const url = API_BASE + '/export?chat=' + encodeURIComponent(chat.key)
+    + '&limit=20000' + authQuery();
+  const link = document.createElement('a');
+  link.href = url;
+  link.rel = 'noopener';
+  document.body.appendChild(link);
+  link.click();
+  document.body.removeChild(link);
+  toast('正在导出聊天记录');
 }
 
 /* ============================ 10. 滚动与已读 ============================ */
@@ -2258,13 +2640,21 @@ function bindEvents() {
     ev.stopPropagation();
   });
 
-  // 消息区：加载更早 / 定位被回复消息 / 复制卡片
+  // 消息区：加载更早 / 定位被回复消息 / 展开合并转发 / 复制卡片
   el.msgList.addEventListener('click', (ev) => {
     if (closestFrom(ev.target, '#loadMoreBtn')) { loadOlder(); return; }
 
     const replyChip = closestFrom(ev.target, '[data-reply-id]');
     if (replyChip) {
       jumpToMessage(replyChip.dataset.replyId);
+      return;
+    }
+    const forwardChip = closestFrom(ev.target, '[data-forward-id]');
+    if (forwardChip) {
+      const row = closestFrom(forwardChip, '.msg');
+      const msg = row && row.dataset.id ? state.msgMap.get(String(row.dataset.id)) : null;
+      const seg = msg ? findForwardSeg(msg, forwardChip.dataset.forwardId) : null;
+      openForwardPreview(seg || { type: 'forward', id: forwardChip.dataset.forwardId });
       return;
     }
     const copyChip = closestFrom(ev.target, '[data-copy]');
@@ -2311,8 +2701,13 @@ function bindEvents() {
     renderPendingAt();
   });
 
-  // 灯箱
+  // 灯箱 / 文件预览弹窗
   el.lightbox.addEventListener('click', closeLightbox);
+  el.fileViewerClose.addEventListener('click', closeFileViewer);
+  el.fileViewer.addEventListener('click', (ev) => {
+    // 点弹窗背景（而不是内容）时关闭；内容和关闭按钮自己处理
+    if (ev.target === el.fileViewer) closeFileViewer();
+  });
 
   // 令牌表单
   el.gateForm.addEventListener('submit', (ev) => {
@@ -2326,6 +2721,7 @@ function bindEvents() {
   // Esc / 点击空白关闭浮层
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
+    if (!el.fileViewer.hidden) { closeFileViewer(); return; }
     if (!el.lightbox.hidden) { closeLightbox(); return; }
     if (!el.atMenu.hidden) { closeAtMenu(); return; }
     if (!el.botMenu.hidden) { closeBotMenu(); return; }

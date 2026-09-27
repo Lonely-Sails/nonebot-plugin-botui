@@ -109,6 +109,21 @@
     <div class="lightbox-tip">点击任意位置或按 Esc 关闭</div>
   </div>
 
+  <!-- 文件在线预览：文本 / 图片 / PDF / 音视频 / 合并转发 -->
+  <div class="file-viewer" id="fileViewer" hidden role="dialog" aria-modal="true" aria-labelledby="fileViewerTitle">
+    <div class="file-card">
+      <header class="file-head">
+        <div class="file-head-main">
+          <h2 class="file-title" id="fileViewerTitle">文件预览</h2>
+          <p class="file-meta" id="fileViewerMeta"></p>
+        </div>
+        <a class="file-action" id="fileViewerSave" href="#" download>下载</a>
+        <button class="file-action" id="fileViewerClose" type="button">关闭</button>
+      </header>
+      <div class="file-body" id="fileViewerBody"></div>
+    </div>
+  </div>
+
   <!-- 消息右键菜单 -->
   <div class="ctx-menu" id="ctxMenu" hidden role="menu"></div>
 

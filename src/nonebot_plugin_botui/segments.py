@@ -8,6 +8,8 @@ from nonebot import logger
 
 MAX_TEXT = 4000
 MAX_RAW = 2000
+# 单条合并转发最多展开的节点数（防止恶意超长转发把响应撑爆）
+MAX_FORWARD_NODES = 200
 
 # 常见的卡片类原始段类型
 _HYPER_TYPES = {'json', 'xml'}
@@ -248,7 +250,61 @@ def _seg_button(seg: Any) -> dict[str, Any]:
 
 
 def _seg_reference(seg: Any) -> dict[str, Any]:
-    return {'type': 'forward', 'id': _clip(getattr(seg, 'id', None)), 'count': None}
+    """``Reference`` / ``Forward`` 段。
+
+    部分适配器（Satori 等）会把转发内容直接挂在 ``children`` 上，那就顺手
+    内联存下来，前端不用再调接口；OneBot V11 只有 ``id``，由前端按需拉取。
+    """
+    item: dict[str, Any] = {
+        'type': 'forward',
+        'id': _clip(getattr(seg, 'id', None)),
+        'count': None,
+    }
+    nodes = _reference_nodes(seg)
+    if nodes:
+        item['nodes'] = nodes
+        item['count'] = len(nodes)
+    return item
+
+
+def _reference_nodes(seg: Any) -> list[dict[str, Any]]:
+    """把 Reference 已带的子节点转成统一形状（拿不到就返回空列表）。"""
+    try:
+        from nonebot_plugin_alconna.uniseg import CustomNode
+    except Exception:  # pragma: no cover - 防御性
+        return []
+    out: list[dict[str, Any]] = []
+    for child in list(getattr(seg, 'children', []) or [])[:MAX_FORWARD_NODES]:
+        if not isinstance(child, CustomNode):
+            continue
+        segments = _node_segments(child.content)
+        if not segments:
+            continue
+        out.append(
+            {
+                'name': _clip(child.name),
+                'user_id': _clip(child.uid),
+                'time': child.time.timestamp() if child.time else 0.0,
+                'segments': segments,
+            }
+        )
+    return out
+
+
+def _node_segments(content: Any) -> list[dict[str, Any]]:
+    """把转发节点的内容（str / UniMessage / 段列表）转成消息段列表。"""
+    if content is None:
+        return []
+    if isinstance(content, str):
+        return [{'type': 'text', 'text': content[:MAX_TEXT]}] if content else []
+    try:
+        from nonebot_plugin_alconna.uniseg import UniMessage
+
+        if isinstance(content, UniMessage):
+            return _convert(content)
+    except Exception:  # pragma: no cover - 防御性
+        pass
+    return _fallback_segments(content)
 
 
 def _seg_other(seg: Any) -> dict[str, Any]:
@@ -452,11 +508,28 @@ def _fill_reply_from_event(segments: list[dict[str, Any]], event: Any) -> None:
             target['preview'] = text[:120]
 
 
+def _raw_type_data(raw: Any) -> tuple[str, dict[str, Any]]:
+    """把原始消息段归一成 ``(类型, 数据)``，兼容对象与 dict 两种形态。
+
+    ``to_segments`` 拿到的可能是适配器的 ``MessageSegment``，也可能是从
+    ``call_api`` 结果里剥出来的普通 dict（合并转发接口就是这种），两种都要认。
+    """
+    if isinstance(raw, dict):
+        rtype = str(raw.get('type') or '')
+        data = raw.get('data')
+        return rtype, data if isinstance(data, dict) else {}
+    rtype = str(getattr(raw, 'type', '') or '')
+    data = getattr(raw, 'data', None)
+    return rtype, data if isinstance(data, dict) else {}
+
+
 def _fallback_segments(message: Any) -> list[dict[str, Any]]:
     """拿不到通用消息段时，直接按原始消息段做最小转换。"""
     out: list[dict[str, Any]] = []
     # 传入的是单个消息段时，包一层方便统一处理
-    if hasattr(message, 'type') and hasattr(message, 'data'):
+    if isinstance(message, dict) or (
+        hasattr(message, 'type') and hasattr(message, 'data')
+    ):
         message = [message]
     try:
         news = list(message)
@@ -466,9 +539,7 @@ def _fallback_segments(message: Any) -> list[dict[str, Any]]:
             out.append({'type': 'text', 'text': text[:MAX_TEXT]})
         return out
     for raw in news:
-        rtype = str(getattr(raw, 'type', '') or '')
-        data = getattr(raw, 'data', None)
-        data = data if isinstance(data, dict) else {}
+        rtype, data = _raw_type_data(raw)
         if rtype == 'text':
             out.append({'type': 'text', 'text': _clip(data.get('text'), MAX_TEXT)})
         elif rtype == 'at':
@@ -519,6 +590,19 @@ def _fallback_segments(message: Any) -> list[dict[str, Any]]:
             uid, name = _reply_identity(data)
             text = _flatten_text(data.get('message') or data.get('content'))
             out.append(_reply_dict(data.get('id', ''), text=text, uid=uid, name=name))
+        elif rtype in ('forward', 'node'):
+            # 合并转发：段本身往往只有一个 id；若数据里带上了展开后的节点
+            # （部分适配器会直接给 content），就一并存下来。
+            item: dict[str, Any] = {
+                'type': 'forward',
+                'id': _clip(data.get('id') or data.get('message_id') or ''),
+                'count': None,
+            }
+            nodes = parse_forward_nodes(data)
+            if nodes:
+                item['nodes'] = nodes
+                item['count'] = len(nodes)
+            out.append(item)
         else:
             out.append(
                 {
@@ -527,6 +611,73 @@ def _fallback_segments(message: Any) -> list[dict[str, Any]]:
                 }
             )
     return out
+
+
+def parse_forward_nodes(raw: Any) -> list[dict[str, Any]]:
+    """把合并转发的节点归一成统一形状。
+
+    输入形态很多：``get_forward_msg`` 的整个返回值（``{'messages': [...]}``）、
+    节点列表、适配器的 ``MessageSegment('node', ...)``，或者 uniseg 的
+    ``CustomNode``。统一输出::
+
+        [{'name': ..., 'user_id': ..., 'time': ..., 'segments': [...]}, ...]
+
+    每个节点的正文走与普通消息相同的段转换逻辑，因此图片、文件等段在展开
+    后仍然可预览。
+    """
+    out: list[dict[str, Any]] = []
+    for node in _iter_nodes(raw)[:MAX_FORWARD_NODES]:
+        if isinstance(node, dict):
+            payload = node.get('data') if isinstance(node.get('data'), dict) else node
+        else:
+            data = getattr(node, 'data', None)
+            payload = data if isinstance(data, dict) else {}
+        content = payload.get('content')
+        if content is None:
+            content = payload.get('message')
+        item = {
+            'name': _clip(payload.get('nickname') or payload.get('name') or ''),
+            'user_id': _clip(payload.get('user_id') or payload.get('uin') or ''),
+            'time': _safe_ts(payload.get('time') or payload.get('timestamp')),
+            'segments': _node_segments(content),
+        }
+        if not item['segments'] and not item['name'] and not item['user_id']:
+            continue
+        out.append(item)
+    return out
+
+
+def _iter_nodes(raw: Any) -> list[Any]:
+    """从各种「合并转发结果」形状里取出节点列表。
+
+    注意不要把单节点的 ``content`` 当成节点容器：那是**节点内的消息内容**，
+    把它当成节点列表会得到一个「把消息段当节点」的错误结果。
+    """
+    if raw is None:
+        return []
+    if isinstance(raw, dict):
+        for key in ('messages', 'nodes'):
+            value = raw.get(key)
+            if isinstance(value, list):
+                return value
+        # 单个节点 dict（带 content / message）
+        if 'content' in raw or 'message' in raw:
+            return [raw]
+        return []
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    # uniseg 的 Reference / CustomNode
+    children = getattr(raw, 'children', None)
+    if isinstance(children, list):
+        return children
+    return []
+
+
+def _safe_ts(value: Any) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def extract_text(message: Any) -> str:

@@ -374,3 +374,95 @@ async def test_search_ignores_empty_keyword(store):
 
     assert await store.search('') == []
     assert await store.search('   ') == []
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_returns_ascending_batches(store):
+    """导出用 stream_messages 从最早往后取，游标按 (ts, id) 严格向前。"""
+    key = _chat_key('group', '1')
+    base = time.time() - 100
+    for i in range(5):
+        store.enqueue(_record(key, f'第{i}条', ts=base + i))
+    await store.flush()
+
+    first = await store.stream_messages(key, limit=2)
+    assert [m.text for m in first] == ['第0条', '第1条']
+
+    second = await store.stream_messages(
+        key, limit=2, after=first[-1].ts, after_id=first[-1].row_id
+    )
+    assert [m.text for m in second] == ['第2条', '第3条']
+
+    third = await store.stream_messages(
+        key, limit=10, after=second[-1].ts, after_id=second[-1].row_id
+    )
+    assert [m.text for m in third] == ['第4条']
+
+
+@pytest.mark.asyncio
+async def test_stream_messages_same_second_no_duplicates(store):
+    """同一秒内的多条消息靠行号区分，翻页不会重复也不会漏。"""
+    key = _chat_key('group', '1')
+    base = time.time()
+    for i in range(4):
+        store.enqueue(_record(key, f'同秒{i}', ts=base))
+    await store.flush()
+
+    seen: list[str] = []
+    after = None
+    after_id = None
+    while True:
+        batch = await store.stream_messages(
+            key, limit=2, after=after, after_id=after_id
+        )
+        if not batch:
+            break
+        seen.extend(m.text for m in batch)
+        after = batch[-1].ts
+        after_id = batch[-1].row_id
+    assert seen == ['同秒0', '同秒1', '同秒2', '同秒3']
+
+
+@pytest.mark.asyncio
+async def test_forward_nodes_reads_inline_nodes(store):
+    """合并转发若已内联节点，按 id 就能在记录里找到。"""
+    from nonebot_plugin_botui.models import MessageRecord
+
+    key = _chat_key('group', '1')
+    nodes = [{'name': '小明', 'segments': [{'type': 'text', 'text': '内容'}]}]
+    store.enqueue(
+        MessageRecord(
+            chat_key=key,
+            chat_kind='group',
+            chat_id='1',
+            direction='in',
+            ts=time.time(),
+            segments=[{'type': 'forward', 'id': 'f1', 'nodes': nodes}],
+        )
+    )
+    await store.flush()
+
+    assert await store.forward_nodes(key, 'f1') == nodes
+    assert await store.forward_nodes(key, '不存在') == []
+
+
+@pytest.mark.asyncio
+async def test_forward_nodes_without_chat_scans_recent(store):
+    """不指定会话时只扫最近的一批消息，返回第一个命中的内联节点。"""
+    from nonebot_plugin_botui.models import MessageRecord
+
+    key = _chat_key('group', '1')
+    nodes = [{'name': '小红', 'segments': [{'type': 'text', 'text': '跨会话'}]}]
+    store.enqueue(
+        MessageRecord(
+            chat_key=key,
+            chat_kind='group',
+            chat_id='1',
+            direction='in',
+            ts=time.time(),
+            segments=[{'type': 'forward', 'id': 'f2', 'nodes': nodes}],
+        )
+    )
+    await store.flush()
+
+    assert await store.forward_nodes(None, 'f2') == nodes

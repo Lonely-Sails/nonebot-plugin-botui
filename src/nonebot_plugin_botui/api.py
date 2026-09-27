@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import time
 import asyncio
 import secrets
@@ -9,7 +10,7 @@ import ipaddress
 from typing import TYPE_CHECKING, Any
 from pathlib import Path
 from dataclasses import replace
-from urllib.parse import urlsplit
+from urllib.parse import quote, urlsplit
 
 import nonebot
 from fastapi import Query, Request, APIRouter, WebSocket, HTTPException
@@ -258,7 +259,13 @@ async def get_meta(request: Request) -> dict[str, Any]:
             'image': True,
             'at': True,
             'reply': True,
+            'file': True,
+            'preview': bool(cfg.botui_file_preview),
+            'export': True,
+            'forward': True,
         },
+        'file_preview': bool(cfg.botui_file_preview),
+        'file_max_bytes': int(cfg.botui_file_max_bytes),
     }
     # 这些是环境细节：数据库在磁盘上的位置、机器人的 self_id 清单、消息总量。
     # 未通过校验时不返回，避免匿名请求就能摸清部署情况。
@@ -734,6 +741,276 @@ async def get_media(request: Request, u: str = Query(..., min_length=8)) -> Any:
         content=data,
         media_type=ctype,
         headers={'Cache-Control': 'private, max-age=3600'},
+    )
+
+
+# ── 文件：下载 / 预览 / 合并转发 / 导出 ────────────────────────────────────
+async def _resolve_media_url(store: 'MessageStore | None', raw: str) -> str:
+    """把消息段里的文件地址解析成可直接访问的 http(s) 链接。
+
+    有些适配器只给一个文件 ID（拿不到直链），那就用 ``message_by_message_id``
+    反查那条记录，从它已经存下的段里找可用的 url。纯文件名则无从下手，
+    返回空串由调用方报错。
+    """
+    url = str(raw or '').strip()
+    if not url:
+        return ''
+    if url.startswith(('http://', 'https://')):
+        return url
+    if store is not None and len(url) <= 256:
+        record = await store.message_by_message_id(url)
+        if record is not None:
+            for seg in record.segments:
+                candidate = str(seg.get('url') or '').strip()
+                if candidate.startswith(('http://', 'https://')):
+                    return candidate
+    return ''
+
+
+def _content_disposition(disposition: str, filename: str) -> str:
+    """构造 Content-Disposition，兼顾非 ASCII 文件名。"""
+    safe = filename.replace('\\', '_').replace('/', '_').replace('"', '')
+    ascii_name = safe.encode('ascii', 'ignore').decode('ascii').strip() or 'file'
+    return (
+        f'{disposition}; '
+        f'filename="{ascii_name}"; '
+        f"filename*=UTF-8''{quote(safe, safe='')}"
+    )
+
+
+# 逐跳透传的响应头（缓存类头自己定，避免把上游的私密策略拍给浏览器）
+_PASSTHROUGH_HEADERS = (
+    'content-length',
+    'content-range',
+    'accept-ranges',
+    'etag',
+    'last-modified',
+)
+
+
+@router.get('/api/file')
+async def get_file(
+    request: Request,
+    u: str = Query('', max_length=4096),
+    name: str = Query('', max_length=300),
+    chat: str = Query('', max_length=200),
+    download: int = Query(0, ge=0, le=1),
+) -> Any:
+    """文件代理：在线预览与下载都走这里。
+
+    直接用文件直链会踩两个坑：一是 QQ 的链接带防盗链会 403，二是很多适配器
+    只给一个文件 ID 根本没直链。所以统一由服务端代取：
+
+    - ``Range`` 原样透传，音视频可以拖进度条、大文件可以断点续传；
+    - 体积超过 ``BOTUI_FILE_MAX_BYTES`` 时直接 413，不当无限流量通道；
+    - 只做直通转发，不落盘。
+    """
+    from fastapi.responses import StreamingResponse
+
+    from .media import Blocked, probe, stream
+
+    _guard(request)
+    store = _require_store()
+    url = await _resolve_media_url(store, u)
+    if not url:
+        raise HTTPException(status_code=400, detail='缺少可用的文件链接')
+
+    range_header = request.headers.get('range') or ''
+    upstream_headers = {'Range': range_header} if range_header else None
+    try:
+        head = await probe(url, headers=upstream_headers)
+    except Blocked as e:
+        raise HTTPException(status_code=403, detail=str(e)) from e
+    except Exception as e:
+        logger.opt(exception=True).warning(f'BotUI failed to open file: {e}')
+        raise HTTPException(status_code=502, detail=f'获取文件失败：{e}') from e
+
+    max_bytes = int(cfg.botui_file_max_bytes)
+    length = head.headers.get('content-length')
+    if max_bytes > 0 and head.status_code == 200 and length:
+        try:
+            if int(length) > max_bytes:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f'文件过大（{(int(length) / 1048576):.1f} MB，'
+                        f'上限 {max_bytes // 1048576} MB）'
+                    ),
+                )
+        except ValueError:  # pragma: no cover - 上游乱给 content-length
+            pass
+
+    ctype = (head.headers.get('content-type') or '').split(';')[0].strip()
+    filename = name or Path(urlsplit(url).path).name or 'file'
+    headers = {
+        key: head.headers[key] for key in _PASSTHROUGH_HEADERS if key in head.headers
+    }
+    headers['Cache-Control'] = 'private, max-age=600'
+    headers['Content-Disposition'] = _content_disposition(
+        'attachment' if download else 'inline', filename
+    )
+
+    async def _body():
+        try:
+            async for chunk in stream(url, headers=upstream_headers):
+                yield chunk
+        except Blocked as e:  # pragma: no cover - 重定向后才发现也在上面拦
+            logger.warning(f'BotUI file stream blocked: {e}')
+        except Exception as e:
+            # 响应头已经发出，只能中断传输（浏览器会提示下载失败）
+            logger.debug(f'BotUI file stream aborted: {e}')
+
+    return StreamingResponse(
+        _body(),
+        status_code=head.status_code,
+        media_type=ctype or 'application/octet-stream',
+        headers=headers,
+    )
+
+
+@router.get('/api/preview')
+async def get_preview(
+    request: Request,
+    u: str = Query('', max_length=4096),
+    name: str = Query('', max_length=300),
+    chat: str = Query('', max_length=200),
+) -> dict[str, Any]:
+    """文本文件在线预览：只读前 512 KB，避免大文件把内存吃光。"""
+    from .media import fetch_text, is_textual
+
+    _guard(request)
+    if not cfg.botui_file_preview:
+        raise HTTPException(status_code=403, detail='BotUI 未开启文件在线预览')
+    store = _require_store()
+    url = await _resolve_media_url(store, u)
+    if not url:
+        raise HTTPException(status_code=400, detail='缺少可用的文件链接')
+
+    result = await fetch_text(url)
+    if result is None:
+        raise HTTPException(status_code=502, detail='无法读取文件内容')
+    text, truncated, ctype, total = result
+    if not is_textual(ctype, name or url):
+        raise HTTPException(status_code=415, detail='该文件不是文本类型，无法在线预览')
+    return {
+        'ok': True,
+        'name': name or Path(urlsplit(url).path).name or '文件',
+        'text': text,
+        'truncated': truncated,
+        'content_type': ctype or None,
+        'bytes': total,
+        'url': url,
+    }
+
+
+@router.get('/api/forward')
+async def get_forward(
+    request: Request,
+    id: str = Query(..., min_length=1, max_length=200),
+    chat: str = Query('', max_length=200),
+) -> dict[str, Any]:
+    """展开合并转发。
+
+    优先用记录里已内联的节点（部分适配器把内容直接放在了段里）；没有就调用
+    适配器的 ``get_forward_msg``，失败时换成 ``get_forward_message`` 再试一次：
+    不同适配器称呼不一样。
+    """
+    from .segments import parse_forward_nodes
+
+    _guard(request)
+    store = _require_store()
+
+    inline = await store.forward_nodes(chat or None, id)
+    if inline:
+        return {'ok': True, 'id': id, 'source': 'record', 'nodes': inline}
+
+    chat_record = store.chat(chat) if chat else None
+    bot = _pick_bot(chat_record)
+    if bot is None:
+        raise HTTPException(
+            status_code=404, detail='展开合并转发需要该会话的机器人在线'
+        )
+
+    timeout = float(cfg.botui_api_timeout)
+    attempts = (
+        ('get_forward_msg', {'id': id}),
+        ('get_forward_msg', {'message_id': id}),
+        ('get_forward_message', {'message_id': id}),
+    )
+    last_error: Exception | None = None
+    for api_name, params in attempts:
+        try:
+            result = await asyncio.wait_for(
+                bot.call_api(api_name, **params), timeout=timeout
+            )
+        except Exception as e:
+            last_error = e
+            continue
+        nodes = parse_forward_nodes(result)
+        if nodes:
+            return {'ok': True, 'id': id, 'source': 'api', 'nodes': nodes}
+    logger.debug(f'BotUI cannot expand forward {id}: {last_error!r}')
+    adapter = bot.adapter.get_name()
+    raise HTTPException(
+        status_code=404,
+        detail=f'无法展开这条合并转发（适配器 {adapter} 可能不支持）',
+    )
+
+
+@router.get('/api/export')
+async def get_export(
+    request: Request,
+    chat: str = Query(..., min_length=1, max_length=200),
+    limit: int = Query(20000, ge=1, le=200000),
+) -> Any:
+    """导出某个会话的聊天记录（JSON，含全部消息段）。"""
+    from fastapi.responses import Response
+
+    _guard(request)
+    store = _require_store()
+    record = store.chat(chat)
+    kind, chat_id = split_chat_key(chat)
+
+    messages: list[dict[str, Any]] = []
+    after: float | None = None
+    after_id: int | None = None
+    while len(messages) < limit:
+        batch = await store.stream_messages(
+            chat, min(1000, limit - len(messages)), after, after_id
+        )
+        if not batch:
+            break
+        messages.extend(m.to_dict() for m in batch)
+        after = batch[-1].ts
+        after_id = batch[-1].row_id
+        if len(batch) < 1000:
+            break
+
+    payload = {
+        'name': 'BotUI',
+        'version': VERSION,
+        'exported_at': time.time(),
+        'chat': record.to_dict()
+        if record is not None
+        else {
+            'key': chat,
+            'kind': kind,
+            'id': chat_id,
+            'name': chat_id,
+        },
+        'count': len(messages),
+        'messages': messages,
+    }
+    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    title = (record.name if record is not None else chat_id) or chat_id
+    filename = f'{title}-{int(payload["exported_at"])}.json'
+    return Response(
+        content=text.encode('utf-8'),
+        media_type='application/json; charset=utf-8',
+        headers={
+            'Content-Disposition': _content_disposition('attachment', filename),
+            'Cache-Control': 'no-store',
+        },
     )
 
 
