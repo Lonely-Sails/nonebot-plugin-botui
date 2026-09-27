@@ -27,6 +27,7 @@ const ROOT_BASE = new URL('./', document.baseURI).href.replace(/\/$/, '');
 const TOKEN_KEY = 'botui_token';
 const THEME_KEY = 'botui_theme';
 const BOT_KEY = 'botui_bot';   // 当前选中的机器人（会话按机器人区分）
+const CHAT_KEY = 'botui_chat'; // 每个机器人最近打开的会话（{self_id: chat_key}）
 
 const PAGE_LIMIT_FALLBACK = 50;  // 每次拉取消息条数（后端可用 BOTUI_PAGE_SIZE 覆盖）
 const MSG_MAX = 1200;       // 前端保留的最大消息数
@@ -554,6 +555,45 @@ function saveBot(selfId) {
   } catch (err) { /* 忽略 */ }
 }
 
+/* --- 会话记忆：记下每个机器人最近打开的会话，下次打开自动回到它 --- */
+function readStoredChats() {
+  try {
+    const raw = localStorage.getItem(CHAT_KEY);
+    if (!raw) return {};
+    const data = JSON.parse(raw);
+    return (data && typeof data === 'object') ? data : {};
+  } catch (err) { return {}; }
+}
+
+/** 取某个机器人上次打开的会话 key（没有记到则返回空串） */
+function storedChatFor(selfId) {
+  if (!hasText(selfId)) return '';
+  const all = readStoredChats();
+  const key = all[String(selfId)];
+  return hasText(key) ? String(key) : '';
+}
+
+/** 记录当前打开的会话（按会话 key 里的机器人 ID 分别保存） */
+function saveChat(key) {
+  const selfId = botOfKey(key);
+  if (!hasText(selfId) || !hasText(key)) return;
+  try {
+    const all = readStoredChats();
+    all[selfId] = String(key);
+    localStorage.setItem(CHAT_KEY, JSON.stringify(all));
+  } catch (err) { /* 忽略 */ }
+}
+
+/**
+ * 自动打开上次在当前机器人下查看的会话。
+ * 没有记录、或那个会话已经不存在（被清空/换了机器人）时什么都不做。
+ */
+function restoreLastChat() {
+  const key = storedChatFor(state.botId);
+  if (!key || !state.chatMap.has(key)) return;
+  openChat(key).catch(() => { /* 静默失败：401 已弹令牌页，其余等下次重同步 */ });
+}
+
 /* --- 主题：默认深色，浅色通过 html[data-theme] --- */
 function applyTheme(theme) {
   const next = theme === 'light' ? 'light' : 'dark';
@@ -858,6 +898,7 @@ async function selectBot(selfId) {
   try {
     await loadChats();
     renderConnMeta();
+    restoreLastChat();   // 回到这个机器人上次查看的会话
   } catch (err) {
     if (!err || err.status !== 401) statusErr(err && err.message ? err.message : '切换机器人失败');
   }
@@ -1740,6 +1781,7 @@ async function openChat(key) {
   if (!chat) return;
 
   state.current = chat;
+  saveChat(chat.key);   // 记住这个会话，下次打开自动回到它
   state.unread.set(chat.key, 0);
   state.pending.delete(chat.key);
   state.messages = [];
@@ -2855,6 +2897,8 @@ async function enterApp() {
   await loadChats();
   renderConnMeta();
   startRealtime();
+  // 自动回到上次查看的会话（在实时连接建立后打开，不阻塞连接）
+  restoreLastChat();
 }
 
 async function bootstrap() {
