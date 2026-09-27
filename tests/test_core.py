@@ -360,6 +360,89 @@ def test_media_total_bytes_parsing():
     assert _total_bytes({}) == 0
 
 
+def test_resolve_file_name_from_url():
+    """QQ 适配器的 File 段只给 url、name 恒为 file.bin，要从链接里还原真名。"""
+    from nonebot_plugin_botui.segments import resolve_file_name
+
+    # 查询串优先：fname 里的 + 是编码后的空格
+    qq = (
+        'https://njc-download.ftn.qq.com/ftn_handler/524d7bd623'
+        '?fname=404+-+%E9%A1%B5%E9%9D%A2%E6%9C%AA%E6%89%BE%E5%88%B0.html'
+    )
+    assert resolve_file_name('file.bin', qq) == '404 - 页面未找到.html'
+    assert resolve_file_name(None, qq) == '404 - 页面未找到.html'
+    # 段里给了真实名字时优先用段里的
+    assert resolve_file_name('报表.xlsx', qq) == '报表.xlsx'
+
+    # 没有查询串时退回路径末段
+    assert (
+        resolve_file_name('file.bin', 'https://e.com/a/b/%E6%8A%A5%E5%91%8A.pdf')
+        == '报告.pdf'
+    )
+    assert resolve_file_name('file.bin', 'https://e.com/dl/photo.jpg') == 'photo.jpg'
+
+    # 占位名与拿不到名字时给兜底
+    assert resolve_file_name('file.bin', 'https://x.io/download') == '文件'
+    assert resolve_file_name(None, '') == '文件'
+    assert resolve_file_name('file.bin', '') == '文件'
+    # 非法字符被清掉，路径分隔符不会留下来
+    assert resolve_file_name('a/b\\c.txt', '') == 'abc.txt'
+
+
+def test_guess_mime_from_url():
+    """按链接里的文件名猜 MIME，供界面挑预览方式。"""
+    from nonebot_plugin_botui.segments import guess_mime
+
+    assert guess_mime('https://e.com/x/报告.pdf') == 'application/pdf'
+    assert guess_mime('https://e.com/x/a.png') == 'image/png'
+    assert guess_mime('https://e.com/x/download') is None
+    assert guess_mime('') is None
+
+
+def test_file_segment_uses_url_name():
+    """整段转换时 File 段应输出还原后的文件名与 MIME。"""
+    from nonebot_plugin_botui.segments import segment_to_dict
+
+    class _File:
+        type = 'file'
+        name = 'file.bin'
+        url = 'https://e.com/a/%E6%8A%A5%E5%91%8A.pdf'
+        file = ''
+        mimetype = 'application/octet-stream'
+
+    from nonebot_plugin_alconna.uniseg.segment import File
+
+    seg = File(
+        url='https://e.com/a/%E6%8A%A5%E5%91%8A.pdf',
+        name='file.bin',
+    )
+    out = segment_to_dict(seg)
+    assert out is not None
+    assert out['type'] == 'file'
+    assert out['name'] == '报告.pdf'
+    assert out['mime'] == 'application/pdf'
+
+
+def test_fallback_file_segment_uses_url_name():
+    """兜底路径同样要还原文件名。"""
+    from nonebot_plugin_botui.segments import _fallback_segments
+
+    out = _fallback_segments(
+        {
+            'type': 'file',
+            'data': {
+                'url': 'https://e.com/dl?filename=%E5%B9%B4%E6%8A%A5.xlsx',
+                'file': 'file.bin',
+            },
+        }
+    )
+    assert out[0]['type'] == 'file'
+    assert out[0]['name'] == '年报.xlsx'
+    assert out[0]['mime'] == (
+        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'
+    )
+
+
 def test_config_route_normalization():
     from nonebot_plugin_botui.config import Config
 

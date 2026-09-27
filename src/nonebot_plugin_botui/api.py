@@ -29,6 +29,7 @@ from .models import (
     describe_segments,
 )
 from .capture import resume_sent, suppress_sent, build_outgoing
+from .segments import guess_mime, resolve_file_name
 
 if TYPE_CHECKING:
     from .store import MessageStore
@@ -778,6 +779,22 @@ def _content_disposition(disposition: str, filename: str) -> str:
     )
 
 
+def _upstream_filename(header: str | None) -> str:
+    """从上游的 ``Content-Disposition`` 里取出文件名（优先 RFC 5987）。"""
+    if not header:
+        return ''
+    text = str(header)
+    idx = text.lower().find("filename*=utf-8''")
+    if idx >= 0:
+        tail = text[idx + len("filename*=utf-8''") :]
+        return tail.split(';')[0].strip().strip('"')
+    idx = text.lower().find('filename=')
+    if idx >= 0:
+        tail = text[idx + len('filename=') :]
+        return tail.split(';')[0].strip().strip('"')
+    return ''
+
+
 # 逐跳透传的响应头（缓存类头自己定，避免把上游的私密策略拍给浏览器）
 _PASSTHROUGH_HEADERS = (
     'content-length',
@@ -841,7 +858,13 @@ async def get_file(
             pass
 
     ctype = (head.headers.get('content-type') or '').split(';')[0].strip()
-    filename = name or Path(urlsplit(url).path).name or 'file'
+    # QQ 这类直链的 content-type 常是 octet-stream；用链接里的后缀补一个更准的
+    if not ctype or ctype == 'application/octet-stream':
+        ctype = guess_mime(url) or ctype
+    filename = resolve_file_name(
+        name or _upstream_filename(head.headers.get('content-disposition')),
+        url,
+    )
     headers = {
         key: head.headers[key] for key in _PASSTHROUGH_HEADERS if key in head.headers
     }
@@ -886,15 +909,16 @@ async def get_preview(
     if not url:
         raise HTTPException(status_code=400, detail='缺少可用的文件链接')
 
+    filename = resolve_file_name(name, url)
     result = await fetch_text(url)
     if result is None:
         raise HTTPException(status_code=502, detail='无法读取文件内容')
     text, truncated, ctype, total = result
-    if not is_textual(ctype, name or url):
+    if not is_textual(ctype, filename):
         raise HTTPException(status_code=415, detail='该文件不是文本类型，无法在线预览')
     return {
         'ok': True,
-        'name': name or Path(urlsplit(url).path).name or '文件',
+        'name': filename,
         'text': text,
         'truncated': truncated,
         'content_type': ctype or None,

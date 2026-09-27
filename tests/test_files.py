@@ -162,12 +162,13 @@ async def local_http(monkeypatch: pytest.MonkeyPatch):
             writer.close()
             return
         request = head.decode('latin-1')
-        path = request.split(' ')[1] if ' ' in request else '/'
+        target = request.split(' ')[1] if ' ' in request else '/'
+        path, _, query = target.partition('?')
         range_header = ''
         for line in request.split('\r\n'):
             if line.lower().startswith('range:'):
                 range_header = line.split(':', 1)[1].strip()
-        received.append({'path': path, 'range': range_header})
+        received.append({'path': path, 'query': query, 'range': range_header})
 
         body = bodies.get(path, b'not found')
         start, end = 0, len(body) - 1
@@ -270,6 +271,40 @@ async def test_preview_rejects_binary(client: AsyncClient, seeded, local_http):
     assert resp.status_code in (415, 200)
     if resp.status_code == 415:
         assert '文本' in resp.json()['error']
+
+
+async def test_preview_recovers_name_from_url(client: AsyncClient, seeded, local_http):
+    """QQ 适配器只给直链、name 是 file.bin 时，预览要能按链接还原真名。"""
+    base, _ = local_http
+    resp = await client.get(
+        '/botui/api/preview',
+        params={
+            'u': base + '/note.txt?fname=%E7%AC%94%E8%AE%B0.txt',
+            'name': 'file.bin',
+        },
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200
+    assert resp.json()['name'] == '笔记.txt'
+
+
+async def test_file_download_recovers_name_from_url(
+    client: AsyncClient, seeded, local_http
+):
+    """下载响应头里的文件名同样要从链接还原，而不是干掉成 file。"""
+    base, _ = local_http
+    resp = await client.get(
+        '/botui/api/file',
+        params={
+            'u': base + '/note.txt?fname=%E7%AC%94%E8%AE%B0.txt',
+            'name': 'file.bin',
+            'download': 1,
+        },
+        headers=HEADERS,
+    )
+    assert resp.status_code == 200
+    disposition = resp.headers['content-disposition']
+    assert "filename*=UTF-8''%E7%AC%94%E8%AE%B0.txt" in disposition
 
 
 # ── 合并转发 ────────────────────────────────────────────────────────────

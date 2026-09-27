@@ -1301,7 +1301,9 @@ function buildMediaPlayer(seg, kind) {
   player.controls = true;
   player.preload = 'metadata';
   if (kind === 'video') player.playsInline = true;
-  player.src = proxied(seg.url);
+  // 走 /api/file 而不是 /api/media：媒体要支持 Range（拖进度条），
+  // /api/media 是整段读取且有体积上限，只适合图片。
+  player.src = fileUrl(seg.url, fileNameOf(seg), false);
   player.addEventListener('error', () => {
     if (!player.parentNode) return;
     const fallback = placeholderChip(label + suffix, seg.url);
@@ -1315,6 +1317,80 @@ function fileExt(name) {
   const text = hasText(name) ? String(name).trim() : '';
   const dot = text.lastIndexOf('.');
   return dot >= 0 && dot < text.length - 1 ? text.slice(dot + 1).toLowerCase() : '';
+}
+
+/** 通用段给出的占位文件名（拿不到真名时就是它们） */
+const PLACEHOLDER_NAMES = ['file.bin', 'file', 'files', 'media', 'media.bin',
+  'image', 'image.png', 'audio.mp3', 'voice.wav', 'video.mp4'];
+
+/**
+ * 从下载直链里还原真实文件名。
+ * 与服务端 segments.resolve_file_name 同一套规则（这里只是给旧记录兜底，
+ * 新记录服务端已经存好真名了）：查询串 fname/filename/name → 路径末段。
+ */
+function fileNameFromUrl(raw) {
+  const url = hasText(raw) ? String(raw) : '';
+  if (!url) return '';
+  let path = url;
+  let query = '';
+  const q = url.indexOf('?');
+  if (q >= 0) { query = url.slice(q + 1); path = url.slice(0, q); }
+  const keys = ['fname', 'filename', 'file_name', 'name', 'realname', 'real_name'];
+  for (const part of query.split('&')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    const key = part.slice(0, eq).toLowerCase();
+    if (keys.indexOf(key) < 0) continue;
+    let value = part.slice(eq + 1);
+    try { value = decodeURIComponent(value.replace(/\+/g, ' ')); } catch { /* 保底用原值 */ }
+    const clean = cleanFileName(value);
+    if (clean && !isPlaceholderName(clean)) return clean;
+  }
+  const last = path.replace(/\/+$/, '').split('/').pop() || '';
+  let decoded = last;
+  try { decoded = decodeURIComponent(last); } catch { /* 保底用原值 */ }
+  const clean = cleanFileName(decoded);
+  if (clean && !isPlaceholderName(clean) && clean.indexOf('.') >= 0) return clean;
+  return '';
+}
+
+/** 去掉文件名里的非法字符（保留中文等非 ASCII） */
+function cleanFileName(value) {
+  return String(value == null ? '' : value)
+    .replace(/[\\/:*?"<>|\r\n\t]/g, '')
+    .replace(/^\.+|\.+$/g, '')
+    .trim();
+}
+
+function isPlaceholderName(name) {
+  const text = String(name || '').trim().toLowerCase();
+  return !text || PLACEHOLDER_NAMES.indexOf(text) >= 0;
+}
+
+/** 文件显示名：段里的 name 优先，是占位名就从链接里还原 */
+function fileNameOf(seg) {
+  const raw = hasText(seg.name) ? String(seg.name).trim() : '';
+  if (raw && !isPlaceholderName(raw)) return raw;
+  return fileNameFromUrl(seg.url) || '未命名文件';
+}
+
+/** 文件 MIME：段里的优先，没有就按链接里的后缀猜（供预览方式判断） */
+function fileMimeOf(seg) {
+  if (hasText(seg.mime)) return String(seg.mime);
+  const ext = fileExt(fileNameOf(seg));
+  const map = {
+    txt: 'text/plain', md: 'text/markdown', log: 'text/plain', json: 'application/json',
+    xml: 'application/xml', yaml: 'application/yaml', yml: 'application/yaml',
+    toml: 'text/plain', ini: 'text/plain', csv: 'text/csv', py: 'text/plain',
+    js: 'text/javascript', ts: 'text/plain', html: 'text/html', htm: 'text/html',
+    css: 'text/css', sql: 'application/sql', vue: 'text/plain',
+    png: 'image/png', jpg: 'image/jpeg', jpeg: 'image/jpeg', gif: 'image/gif',
+    webp: 'image/webp', bmp: 'image/bmp', svg: 'image/svg+xml', ico: 'image/x-icon',
+    pdf: 'application/pdf', mp3: 'audio/mpeg', wav: 'audio/wav', flac: 'audio/flac',
+    m4a: 'audio/mp4', ogg: 'audio/ogg', mp4: 'video/mp4', mov: 'video/quicktime',
+    mkv: 'video/x-matroska', webm: 'video/webm', avi: 'video/x-msvideo'
+  };
+  return map[ext] || '';
 }
 
 /** 按扩展名给文件卡片一个可读的类别名（界面上显示为图标文字） */
@@ -1366,7 +1442,7 @@ const TEXT_EXTS = [
 
 /** 文件卡片：类别图标 + 文件名 + 新窗口预览 / 下载 */
 function buildFileCard(seg) {
-  const name = hasText(seg.name) ? String(seg.name) : '未命名文件';
+  const name = fileNameOf(seg);
   const source = safeUrl(seg.url);
   const card = h('span', 'chip seg-file');
 
@@ -1384,7 +1460,7 @@ function buildFileCard(seg) {
     return card;
   }
 
-  const canPreview = previewKind(name, seg.mime) && (!state.meta || state.meta.file_preview !== false);
+  const canPreview = previewKind(name, fileMimeOf(seg)) && (!state.meta || state.meta.file_preview !== false);
   if (canPreview) {
     const btn = h('button', 'file-btn', '预览');
     btn.type = 'button';
@@ -1981,8 +2057,8 @@ function closeFileViewer() {
 }
 
 async function openFilePreview(seg) {
-  const name = hasText(seg.name) ? String(seg.name) : '未命名文件';
-  const kind = previewKind(name, seg.mime);
+  const name = fileNameOf(seg);
+  const kind = previewKind(name, fileMimeOf(seg));
   if (!kind) { toast('该文件类型不支持预览', true); return; }
   if (state.meta && state.meta.file_preview === false) {
     toast('未开启文件在线预览', true);
@@ -2024,7 +2100,7 @@ async function openFilePreview(seg) {
 
   const url = fileUrl(seg.url, name, false);
   const size = formatBytes(Number(seg.size));
-  openFileViewer(name, [fileKind(name, seg.mime), size].filter(hasText).join(' · '));
+  openFileViewer(name, [fileKind(name, fileMimeOf(seg)), size].filter(hasText).join(' · '));
 
   if (kind === 'image') {
     const img = document.createElement('img');
@@ -2119,7 +2195,8 @@ function openCtxMenu(x, y, msg) {
   const capability = state.meta && state.meta.capabilities ? state.meta.capabilities.recall !== false : true;
   const recallable = msg.recallable === true && capability;
   const fileSeg = firstFileSeg(msg);
-  const previewable = fileSeg && previewKind(fileSeg.name, fileSeg.mime)
+  const previewable = fileSeg
+    && previewKind(fileNameOf(fileSeg), fileMimeOf(fileSeg))
     && (!state.meta || state.meta.file_preview !== false);
 
   const items = [

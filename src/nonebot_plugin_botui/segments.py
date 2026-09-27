@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from typing import Any
+from urllib.parse import unquote, urlsplit, unquote_plus
 
 from nonebot import logger
 
@@ -30,6 +31,138 @@ def _clip(value: Any, limit: int = MAX_RAW) -> str:
     return text[:limit]
 
 
+# 各种适配器/通用段把「真实文件名」放在占位名里表示「没拿到」，见到就当没有。
+_PLACEHOLDER_NAMES = frozenset(
+    {
+        'file.bin',
+        'file',
+        'files',
+        'media',
+        'media.bin',
+        'image',
+        'image.png',
+        'audio.mp3',
+        'voice.wav',
+        'video.mp4',
+    }
+)
+
+# 文件名里不能出现的字符（保留中文等非 ASCII 字符）
+_BAD_NAME_CHARS = set('\\/:*?"<>|\r\n\t')
+
+# URL 查询串里可能带文件名的参数名（不区分大小写）
+_NAME_QUERY_KEYS = (
+    'fname',
+    'filename',
+    'file_name',
+    'name',
+    'realname',
+    'real_name',
+    'displayname',
+    'fn',
+)
+
+
+def _clean_file_name(value: Any) -> str:
+    """把候选文件名清洗成可以直接展示/写进响应头的字符串。
+
+    QQ 的下载链接经常写成 ``404+-+页面未找到.html``（空格被编成 ``+``），
+    这里顺手把加号还原成空格；路径分隔符等非法字符一并剔掉。
+    """
+    if value is None:
+        return ''
+    text = unquote_plus(unquote(str(value))).strip()
+    if text.endswith('"') and text.startswith('"'):
+        text = text[1:-1].strip()
+    text = ''.join(ch for ch in text if ch not in _BAD_NAME_CHARS)
+    text = text.strip().strip('.')
+    return text[:MAX_RAW]
+
+
+def _placeholder_name(name: Any) -> bool:
+    """判断这个名字是不是通用段给的占位名（file.bin / media 之类）。"""
+    text = _clean_file_name(name)
+    if not text:
+        return True
+    return text.strip().lower() in _PLACEHOLDER_NAMES
+
+
+def _name_from_url(url: Any) -> str:
+    """从下载直链里还原真实文件名。
+
+    很多适配器（尤以 QQ 官方机器人适配器为典型）的 ``File`` 段只带一个
+    ``url``，``name`` 一直是默认的 ``file.bin``；而真实文件名就藏在链接里：
+
+    - 查询串：``?fname=404+-+页面未找到.html``、``?filename=报表.xlsx``
+    - 路径段：``.../a1b2c3/报告.pdf``、``.../download/photo.jpg``
+    - 响应头：``Content-Disposition: ... filename="报表.xlsx"``
+
+    这里按「查询串 → 路径末段」的顺序猜，取不到就返回空串。
+    """
+    text = _clip(url, 4096).strip()
+    if not text:
+        return ''
+    if '://' not in text:
+        text = 'http://' + text
+    try:
+        parts = urlsplit(text)
+    except ValueError:
+        return ''
+
+    lowered = {k.lower(): v for k, v in _parse_query(parts.query).items()}
+    for key in _NAME_QUERY_KEYS:
+        if key in lowered:
+            candidate = _clean_file_name(lowered[key])
+            if candidate and not _placeholder_name(candidate):
+                return candidate
+
+    decoded_path = unquote(parts.path)
+    last = decoded_path.rstrip('/').rsplit('/', 1)[-1]
+    candidate = _clean_file_name(last)
+    if candidate and not _placeholder_name(candidate) and '.' in candidate:
+        return candidate
+    return ''
+
+
+def _parse_query(query: str) -> dict[str, str]:
+    """解析查询串（不依赖 parse_qs，避免对空值/重复键的特殊处理）。"""
+    out: dict[str, str] = {}
+    for item in query.split('&'):
+        if not item:
+            continue
+        key, _, value = item.partition('=')
+        if key and key not in out:
+            out[key] = value
+    return out
+
+
+def resolve_file_name(raw_name: Any, url: Any, fallback: str = '文件') -> str:
+    """给出一个尽量真实的文件名：段里的候选名优先，不行再从链接里猜。"""
+    candidate = _clean_file_name(raw_name)
+    if candidate and not _placeholder_name(candidate):
+        return candidate
+    from_url = _name_from_url(url)
+    if from_url:
+        return from_url
+    # 段里给的是 file.bin 这类占位名时，宁可显示兜底名也不要露出占位名
+    return fallback
+
+
+def guess_mime(url: Any) -> str | None:
+    """按链接里的文件名猜 MIME，供界面挑预览方式（拿不到就返回 None）。"""
+    name = _name_from_url(url)
+    if not name or '.' not in name:
+        return None
+    suffix = '.' + name.rsplit('.', 1)[-1].lower()
+    try:
+        import mimetypes
+
+        mime, _ = mimetypes.guess_type('x' + suffix)
+    except Exception:  # pragma: no cover - mimetypes 极少出错
+        return None
+    return mime
+
+
 def _seg_media_dict(stype: str, url: str = '', **extra: Any) -> dict[str, Any]:
     """构造语音/音频/视频段的统一形状。"""
     item: dict[str, Any] = {'type': stype, 'url': url}
@@ -54,15 +187,20 @@ def _seg_image(seg: Any) -> dict[str, Any]:
 
 
 def _seg_media(seg: Any, stype: str) -> dict[str, Any]:
+    url = _clip(
+        getattr(seg, 'url', None)
+        or getattr(seg, 'path', None)
+        or getattr(seg, 'file', None)
+    )
     return _seg_media_dict(
         stype,
-        _clip(
-            getattr(seg, 'url', None)
-            or getattr(seg, 'path', None)
-            or getattr(seg, 'file', None)
-        ),
+        url,
         file=_clip(getattr(seg, 'file', None) or getattr(seg, 'name', None)),
-        name=_clip(getattr(seg, 'name', None)) or None,
+        # QQ 适配器的音频/视频 name 也恒为 audio.mp3 / video.mp4，
+        # 同样从链接里还原真实文件名
+        name=resolve_file_name(getattr(seg, 'name', None), url, fallback='')
+        or None,
+        mime=_clip(getattr(seg, 'mimetype', None)) or guess_mime(url),
         duration=getattr(seg, 'duration', None),
     )
 
@@ -369,11 +507,19 @@ def segment_to_dict(seg: Any) -> dict[str, Any] | None:
             stype = str(getattr(seg, 'type', 'voice') or 'voice')
             return _seg_media(seg, stype)
         if isinstance(seg, File):
+            url = _clip(
+                getattr(seg, 'url', None)
+                or getattr(seg, 'path', None)
+                or getattr(seg, 'file', None)
+            )
             return {
                 'type': 'file',
-                'name': _clip(getattr(seg, 'name', None)) or '文件',
-                'url': _clip(getattr(seg, 'url', None)),
+                # QQ 机器人适配器只给 url、name 恒为 file.bin，真实文件名在链接里
+                'name': resolve_file_name(getattr(seg, 'name', None), url),
+                'url': url,
                 'file': _clip(getattr(seg, 'file', None)),
+                'mime': _clip(getattr(seg, 'mimetype', None)) or guess_mime(url),
+                'size': getattr(seg, 'size', None) or None,
             }
         if isinstance(seg, Reply):
             return _seg_reply(seg)
@@ -569,9 +715,14 @@ def _fallback_segments(message: Any) -> list[dict[str, Any]]:
                 out.append(
                     {
                         'type': 'file',
-                        'name': _clip(data.get('name') or data.get('file')) or '文件',
+                        'name': resolve_file_name(
+                            data.get('name') or data.get('file'), url
+                        ),
                         'url': url,
                         'file': _clip(data.get('file', '')),
+                        'mime': _clip(data.get('content_type') or data.get('mime'))
+                        or guess_mime(url),
+                        'size': data.get('size') or None,
                     }
                 )
             else:
