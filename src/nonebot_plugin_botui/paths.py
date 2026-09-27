@@ -32,3 +32,5 @@ DATA_DIR: Path = get_plugin_data_dir()
 DB_FILE: Path = get_plugin_data_file('botui.sqlite3')
 #: 自动生成的访问令牌文件
 TOKEN_FILE: Path = get_plugin_data_file('token.txt')
+#: WebUI 里上传、等待发送的附件目录（每个附件一个子目录，见 uploads.py）
+UPLOAD_DIR: Path = DATA_DIR / 'uploads'

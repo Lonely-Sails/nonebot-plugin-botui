@@ -93,14 +93,22 @@
           <button class="bar-close" id="replyBarClose" type="button" aria-label="取消回复">✕</button>
         </div>
         <div class="pending-at" id="pendingAt" hidden></div>
+        <div class="pending-files" id="pendingFiles" hidden></div>
         <div class="composer-row">
           <button class="composer-tool" id="atBtn" type="button" title="提及成员（@）">@</button>
+          <button class="composer-tool" id="fileBtn" type="button" title="发送图片 / 文件">＋</button>
           <textarea id="composerInput" class="composer-input" rows="1" placeholder="输入消息，Enter 发送，Shift+Enter 换行" aria-label="消息输入框"></textarea>
           <button class="send-btn" id="sendBtn" type="button">发送</button>
         </div>
         <div class="composer-hint" id="composerHint"></div>
+        <input type="file" id="filePicker" multiple hidden aria-hidden="true">
       </footer>
     </main>
+  </div>
+
+  <!-- 拖拽文件到页面任意位置即可添加附件 -->
+  <div class="drop-overlay" id="dropOverlay" hidden>
+    <div class="drop-overlay-card">松开即可添加附件（图片 / 文件）</div>
   </div>
 
   <!-- 图片灯箱：点击图片查看大图，点击任意处或 Esc 关闭 -->

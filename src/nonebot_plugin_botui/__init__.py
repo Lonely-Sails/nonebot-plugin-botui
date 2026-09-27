@@ -14,6 +14,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import secrets
 
 from nonebot import logger, require, get_driver
@@ -26,7 +27,7 @@ require('nonebot_plugin_apscheduler')
 
 from nonebot_plugin_apscheduler import scheduler
 
-from .paths import DB_FILE, TOKEN_FILE
+from .paths import DB_FILE, TOKEN_FILE, UPLOAD_DIR
 from .store import MessageStore
 from .webui import WebUIServer
 from .config import Config
@@ -34,6 +35,7 @@ from .config import plugin_config as cfg
 from .models import MessageRecord
 from .capture import setup as setup_capture
 from .capture import store_ref, register_hooks
+from .uploads import UploadStore
 
 __plugin_meta__ = PluginMetadata(
     name='BotUI 控制台',
@@ -58,6 +60,7 @@ driver = get_driver()
 # ── 运行时状态（首次用到时创建） ────────────────────────────────────────
 _store: MessageStore | None = None
 _server: WebUIServer | None = None
+_uploads: UploadStore | None = None
 _token: str = ''
 _hooks_ready = False
 
@@ -104,6 +107,18 @@ def _get_server() -> WebUIServer:
     if _server is None:
         _server = WebUIServer()
     return _server
+
+
+def _get_uploads() -> UploadStore:
+    """上传附件的存储（WebUI 里选图/选文件后落盘用）。"""
+    global _uploads
+    if _uploads is None:
+        _uploads = UploadStore(
+            UPLOAD_DIR,
+            max_bytes=cfg.botui_upload_max_bytes,
+            ttl=cfg.botui_upload_ttl,
+        )
+    return _uploads
 
 
 def _on_record_inserted(record: MessageRecord) -> None:
@@ -227,11 +242,18 @@ def _try_mount() -> bool:
 # ── 生命周期 ────────────────────────────────────────────────────────────
 async def _cleanup_job() -> None:
     store = store_ref()
-    if store is None:
+    if store is not None:
+        removed = await store.cleanup()
+        if removed:
+            logger.info(f'BotUI 已清理 {removed} 条超出上限的历史记录')
+    # 顺带回收过期上传附件：选完没发的（ttl）、以及发出后已过保留期的
+    try:
+        dropped = await asyncio.to_thread(_get_uploads().cleanup)
+    except Exception as e:  # pragma: no cover - 清理失败不影响机器人
+        logger.debug(f'BotUI 清理上传附件失败：{e}')
         return
-    removed = await store.cleanup()
-    if removed:
-        logger.info(f'BotUI 已清理 {removed} 条超出上限的历史记录')
+    if dropped:
+        logger.info(f'BotUI 已清理 {dropped} 个过期上传附件')
 
 
 def _log_banner(mounted: bool, store: MessageStore) -> None:
@@ -276,7 +298,7 @@ async def _on_startup() -> None:
     from . import api
 
     server = _get_server()
-    api.setup(store, server, _token)
+    api.setup(store, server, _token, _get_uploads())
     mounted = _try_mount()
     await _seed_bots()
     if cfg.botui_allow_remote and not cfg.botui_auth:

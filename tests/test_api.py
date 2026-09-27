@@ -796,6 +796,290 @@ async def test_send_rejects_too_long(client: AsyncClient, seeded):
     assert resp.status_code == 400
 
 
+# ── 附件上传与发送 ──────────────────────────────────────────────────────
+_PNG = (
+    b'\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01'
+    b'\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01'
+    b'\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82'
+)
+
+
+def _connected_bot():
+    """接一个假的 OneBot 机器人上来，返回 ``(adapter, bot, restore)``。
+
+    ``_call_api`` 被换成记录型替身：既能返回消息 ID，也方便断言发出的消息段
+    里确实带了图片 / 文件。
+    """
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot, Adapter
+
+    adapter = nonebot.get_adapter(Adapter)
+    bot = Bot(adapter, self_id=BOT_ID)
+    calls: list[tuple[str, dict]] = []
+
+    async def fake_call_api(_bot, api, **data):
+        calls.append((api, data))
+        return {'message_id': 9500, 'status': 'ok'}
+
+    original = adapter._call_api
+    adapter._call_api = fake_call_api  # type: ignore[method-assign]
+    adapter.bot_connect(bot)
+
+    def restore() -> None:
+        adapter.bot_disconnect(bot)
+        adapter._call_api = original
+
+    return bot, calls, restore
+
+
+async def test_upload_requires_token(client: AsyncClient):
+    resp = await client.post('/botui/api/upload?name=a.png', content=b'x')
+    assert resp.status_code == 401
+    assert resp.json()['ok'] is False
+
+
+async def test_upload_rejects_empty_body(client: AsyncClient, seeded):
+    resp = await client.post(
+        '/botui/api/upload?name=a.png', headers=HEADERS, content=b''
+    )
+    assert resp.status_code == 400
+
+
+async def test_upload_rejects_too_large(
+    client: AsyncClient, seeded, monkeypatch: pytest.MonkeyPatch
+):
+    """超过 BOTUI_UPLOAD_MAX_BYTES 的附件在写盘前就被拦下。"""
+    from src.nonebot_plugin_botui import api
+
+    monkeypatch.setattr(api.cfg, 'botui_upload_max_bytes', 4)
+    resp = await client.post(
+        '/botui/api/upload?name=a.bin', headers=HEADERS, content=b'12345678'
+    )
+    assert resp.status_code == 413
+
+
+async def test_upload_then_fetch_and_delete(client: AsyncClient, botui, seeded):
+    """上传 → 取回 → 删除的完整链路。"""
+    up = await client.post(
+        '/botui/api/upload?name=%E5%9B%BE%E7%89%87.png&type=image/png',
+        headers=HEADERS,
+        content=_PNG,
+    )
+    assert up.status_code == 200
+    info = up.json()['file']
+    assert info['name'] == '图片.png'
+    assert info['kind'] == 'image'
+    assert info['size'] == len(_PNG)
+
+    got = await client.get(f"/botui/api/upload?id={info['id']}", headers=HEADERS)
+    assert got.status_code == 200
+    assert got.content == _PNG
+    assert got.headers['content-type'].startswith('image/png')
+
+    # 鉴权同样是硬要求：图片是 <img src> 直接取的，只能靠 query
+    assert (await client.get(f"/botui/api/upload?id={info['id']}")).status_code == 401
+
+    rm = await client.request(
+        'DELETE', f"/botui/api/upload?id={info['id']}", headers=HEADERS
+    )
+    assert rm.status_code == 200
+    assert rm.json()['removed'] is True
+    assert (
+        await client.get(f"/botui/api/upload?id={info['id']}", headers=HEADERS)
+    ).status_code == 404
+
+
+async def test_upload_rejects_path_traversal(client: AsyncClient, seeded):
+    """id 里带路径分隔符一律拒绝，避免变成读文件接口。"""
+    for uid in ('../../etc/passwd', 'a/b', '..'):
+        resp = await client.get(f'/botui/api/upload?id={uid}', headers=HEADERS)
+        # FastAPI 的 Query(min_length=6) 会先挡掉太短的，其余由 uploads 校验拦截
+        assert resp.status_code in (400, 404, 422), uid
+
+
+async def test_send_image_attachment(client: AsyncClient, botui, seeded):
+    """上传一张 PNG 并发出：请求里应当带上 image 段，记录里也带上。"""
+    store, key = seeded
+    up = await client.post(
+        '/botui/api/upload?name=pic.png&type=image/png',
+        headers=HEADERS,
+        content=_PNG,
+    )
+    uid = up.json()['file']['id']
+
+    _bot, calls, restore = _connected_bot()
+    try:
+        resp = await client.post(
+            '/botui/api/send',
+            headers=HEADERS,
+            json={'chat': key, 'text': '看图', 'uploads': [uid]},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+        assert body['message']['message_id'] == '9500'
+    finally:
+        restore()
+
+    # 发出的 CQ 消息里应当包含 image 段（onebot11 exporter 会转成 base64://）
+    api_name, payload = calls[-1]
+    assert api_name == 'send_msg'
+    message = str(payload['message'])
+    assert '[CQ:image' in message
+    assert 'base64://' in message
+
+    image = next(s for s in body['message']['segments'] if s['type'] == 'image')
+    assert image['name'] == 'pic.png'
+    assert image['url'].startswith('/botui/api/upload?id=')
+    await store.flush()
+
+
+async def test_send_file_attachment(client: AsyncClient, botui, seeded):
+    """非图片附件按 File 段发送：OneBot 走 upload_group_file。"""
+    store, key = seeded
+    up = await client.post(
+        '/botui/api/upload?name=报告.txt&type=text/plain',
+        headers=HEADERS,
+        content='报告内容'.encode(),
+    )
+    assert up.status_code == 200
+    uid = up.json()['file']['id']
+
+    _bot, calls, restore = _connected_bot()
+    try:
+        resp = await client.post(
+            '/botui/api/send',
+            headers=HEADERS,
+            json={'chat': key, 'uploads': [uid]},
+        )
+        assert resp.status_code == 200
+        body = resp.json()
+    finally:
+        restore()
+
+    api_name, payload = calls[-1]
+    assert api_name == 'upload_group_file'
+    assert payload['name'] == '报告.txt'
+    assert payload['file'].endswith('blob')
+
+    file_seg = next(s for s in body['message']['segments'] if s['type'] == 'file')
+    assert file_seg['name'] == '报告.txt'
+    assert file_seg['size'] == len('报告内容'.encode())
+    await store.flush()
+
+
+async def test_send_with_unknown_upload(client: AsyncClient, botui, seeded):
+    """引用了不存在 / 已过期的附件时给出 404，而不是把空消息发出去。"""
+    _, key = seeded
+    resp = await client.post(
+        '/botui/api/send',
+        headers=HEADERS,
+        json={'chat': key, 'text': 'hi', 'uploads': ['nonexistent-id']},
+    )
+    assert resp.status_code == 404
+
+
+async def test_send_rejects_too_many_uploads(client: AsyncClient, botui, seeded):
+    """一次发送的附件数量有上限。"""
+    from src.nonebot_plugin_botui import api
+
+    _, key = seeded
+    resp = await client.post(
+        '/botui/api/send',
+        headers=HEADERS,
+        json={
+            'chat': key,
+            'uploads': [f'id-{i}' for i in range(api.MAX_UPLOADS_PER_MESSAGE + 1)],
+        },
+    )
+    assert resp.status_code == 400
+
+
+async def test_send_rejects_uploads_when_disabled(
+    client: AsyncClient, botui, seeded, monkeypatch: pytest.MonkeyPatch
+):
+    from src.nonebot_plugin_botui import api
+
+    monkeypatch.setattr(api.cfg, 'botui_upload_enabled', False)
+    resp = await client.post(
+        '/botui/api/send',
+        headers=HEADERS,
+        json={'chat': seeded[1], 'uploads': ['whatever-id']},
+    )
+    assert resp.status_code == 403
+
+
+async def test_meta_reports_upload_capability(client: AsyncClient, seeded):
+    meta = (await client.get('/botui/api/meta', headers=HEADERS)).json()
+    assert meta['upload_enabled'] is True
+    assert meta['capabilities']['upload'] is True
+    assert meta['upload_max_bytes'] > 0
+
+
+async def test_cleanup_removes_expired_uploads(tmp_path):
+    """过期附件由 cleanup 回收：没发出的按 ttl，发出的按 retention。"""
+    import json
+    import time
+
+    from src.nonebot_plugin_botui.uploads import UploadStore
+
+    store = UploadStore(tmp_path, ttl=3600.0, retention=3600.0)
+    fresh = store.save(b'hello', 'a.txt')
+    used = store.save(b'world', 'b.txt')
+    store.mark_used(used.id)
+    assert store.get(fresh.id) is not None
+
+    # 把两条附件的「过期时刻」手动拨到过去，避免依赖真实等待时间
+    past = time.time() - 10
+    for uid in (fresh.id, used.id):
+        meta_file = tmp_path / uid / 'meta.json'
+        meta = json.loads(meta_file.read_text(encoding='utf-8'))
+        meta['expires'] = past
+        if meta.get('used'):
+            # 已发出的按 used_at + retention 判断，这里把发出时间也推到过去
+            meta['used_at'] = past - store.retention - 10
+        meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+
+    removed = store.cleanup()
+    # 没发出的过期了，已发出的也过了 retention，两条都该清掉
+    assert removed == 2
+    assert store.get(fresh.id) is None
+    assert store.get(used.id) is None
+
+
+async def test_used_upload_survives_ttl(tmp_path):
+    """已发出的附件不应按 ttl 过期：否则发出后一小时聊天记录里的图就坏了。"""
+    import json
+    import time
+
+    from src.nonebot_plugin_botui.uploads import UploadStore
+
+    store = UploadStore(tmp_path, ttl=3600.0, retention=99999.0)
+    used = store.save(b'world', 'b.txt')
+    store.mark_used(used.id)
+    meta_file = tmp_path / used.id / 'meta.json'
+    meta = json.loads(meta_file.read_text(encoding='utf-8'))
+    meta['expires'] = time.time() - 10
+    meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
+
+    assert store.get(used.id) is not None
+    assert store.cleanup() == 0
+    assert store.get(used.id) is not None
+
+
+async def test_upload_filename_is_sanitized(tmp_path):
+    """浏览器给的名字可能带路径，落盘时必须只保留基名。"""
+    from src.nonebot_plugin_botui.uploads import UploadStore, safe_filename
+
+    assert safe_filename('C:\\Users\\a\\图片.png') == '图片.png'
+    assert safe_filename('../../etc/passwd') == 'passwd'
+    assert safe_filename('') == 'file'
+
+    store = UploadStore(tmp_path, ttl=3600)
+    record = store.save(b'x', '../../evil.sh')
+    assert record.name == 'evil.sh'
+    assert record.path.parent.parent == tmp_path
+
+
 # ── 撤回 ────────────────────────────────────────────────────────────────
 async def test_recall_unknown_id(client: AsyncClient, seeded):
     resp = await client.post('/botui/api/recall', headers=HEADERS, json={'id': 999999})

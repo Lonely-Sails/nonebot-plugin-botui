@@ -34,6 +34,7 @@ from .segments import guess_mime, resolve_file_name
 if TYPE_CHECKING:
     from .store import MessageStore
     from .webui import WebUIServer
+    from .uploads import UploadStore, UploadRecord
 
 VERSION = '0.1.0'
 
@@ -41,25 +42,48 @@ VERSION = '0.1.0'
 # 二是让服务端在下一次发送时发现已经断掉的连接。
 WS_HEARTBEAT = 25.0
 
+#: 一次发送最多带几个附件（多了适配器多半也发不出去，还会把请求撑得很大）
+MAX_UPLOADS_PER_MESSAGE = 10
+
 router = APIRouter()
 
 _store: 'MessageStore | None' = None
 _server: 'WebUIServer | None' = None
+_uploads: 'UploadStore | None' = None
 _token: str = ''
 _last_send: dict[str, float] = {}
 _static_dir = Path(__file__).parent / 'static'
 
 
-def setup(store: 'MessageStore', server: 'WebUIServer', token: str) -> None:
+def setup(
+    store: 'MessageStore',
+    server: 'WebUIServer',
+    token: str,
+    uploads: 'UploadStore | None' = None,
+) -> None:
     """注入依赖（由插件在启动时调用一次）。
 
     存储、事件服务、令牌都由这里一次性注入，而不是一半用模块变量、一半塞进
     ``app.state`` —— 两套机制混用会让「谁先谁后」变得难以推断。
+
+    ``uploads`` 是 WebUI 上传附件的存储（见 ``uploads.py``）；不传时按配置
+    创建一个默认实例，方便测试直接调用本模块。
     """
-    global _store, _server, _token
+    global _store, _server, _token, _uploads
     _store = store
     _server = server
     _token = token
+    if uploads is not None:
+        _uploads = uploads
+    elif _uploads is None:
+        from .paths import UPLOAD_DIR
+        from .uploads import UploadStore
+
+        _uploads = UploadStore(
+            UPLOAD_DIR,
+            max_bytes=cfg.botui_upload_max_bytes,
+            ttl=cfg.botui_upload_ttl,
+        )
 
 
 def auth_required() -> bool:
@@ -264,9 +288,12 @@ async def get_meta(request: Request) -> dict[str, Any]:
             'preview': bool(cfg.botui_file_preview),
             'export': True,
             'forward': True,
+            'upload': bool(cfg.botui_upload_enabled and cfg.botui_write_enabled),
         },
         'file_preview': bool(cfg.botui_file_preview),
         'file_max_bytes': int(cfg.botui_file_max_bytes),
+        'upload_enabled': bool(cfg.botui_upload_enabled and cfg.botui_write_enabled),
+        'upload_max_bytes': int(cfg.botui_upload_max_bytes),
     }
     # 这些是环境细节：数据库在磁盘上的位置、机器人的 self_id 清单、消息总量。
     # 未通过校验时不返回，避免匿名请求就能摸清部署情况。
@@ -502,8 +529,159 @@ async def _throttle(key: str) -> None:
     _last_send[key] = time.time()
 
 
-async def _send_via_bot(bot: Bot, chat: ChatRecord, at_list, text: str, reply_to: str):
-    """真正把消息发出去，返回回执。"""
+# ── 上传附件（WebUI 里选图/选文件后以机器人身份发出）────────────────────
+async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
+    """从上传请求里取出 ``(字节, 文件名, 类型)``。
+
+    刻意**不**解析 multipart/form-data：那需要额外依赖 python-multipart，
+    而前端完全不必装成表单 —— 直接把文件字节放在请求体里、把文件名与类型放进
+    查询参数（``?name=`` / ``?type=``）即可。请求体就是一段裸字节流，读取、
+    限制大小、测试都简单得多（curl 用 ``--data-binary @a.png`` 即可）。
+    """
+    data = await request.body()
+    name = request.query_params.get('name', '')
+    mime = request.query_params.get('type', '')
+    return data, name, mime
+
+
+@router.post('/api/upload')
+async def post_upload(request: Request) -> dict[str, Any]:
+    """把附件（图片 / 文件）存到服务端，返回一个可在 ``/api/send`` 里引用的 id。
+
+    前端「选附件」这一步就调这里：附件先落盘，之后带上 ``uploads: [id]`` 发送。
+    这么拆是因为发送前往往要展示预览（图片缩略图、文件名），而发送时才需要
+    真实文件；一次性把文件塞进发送请求会让「预览」变得没有意义。
+    """
+    _guard_write(request)
+    if not cfg.botui_upload_enabled:
+        raise HTTPException(status_code=403, detail='BotUI 未开启附件上传')
+    if _uploads is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
+
+    data, name, mime = await _read_uploaded(request)
+    if not data:
+        raise HTTPException(status_code=400, detail='没有收到文件内容')
+    limit = int(cfg.botui_upload_max_bytes)
+    if limit > 0 and len(data) > limit:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f'文件过大（{len(data) / 1048576:.1f} MB，上限 {limit // 1048576} MB）'
+            ),
+        )
+    try:
+        record = await asyncio.to_thread(_uploads.save, data, name, mime)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    except Exception as e:  # pragma: no cover - 磁盘异常
+        logger.opt(exception=True).warning(f'BotUI failed to save upload: {e}')
+        raise HTTPException(status_code=500, detail=f'保存附件失败：{e}') from e
+    return {'ok': True, 'file': record.to_dict()}
+
+
+@router.get('/api/upload')
+async def get_upload(
+    request: Request,
+    id: str = Query(..., min_length=6, max_length=64),
+    download: int = Query(0, ge=0, le=1),
+) -> Any:
+    """取回 WebUI 上传的附件（图片缩略图 / 下载）。
+
+    消息段里的 url 就指向这里，所以渲染聊天记录时本地图片也能正常显示 ——
+    不必依赖任何外部图床。仅本机 + 令牌可访问（``_guard``）。
+    """
+    _guard(request)
+    if _uploads is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
+    record = _uploads.get(id)
+    if record is None or not record.path.is_file():
+        raise HTTPException(status_code=404, detail='附件不存在或已过期')
+    disposition = 'attachment' if download else 'inline'
+    return FileResponse(
+        record.path,
+        media_type=record.mime or 'application/octet-stream',
+        filename=record.name,
+        content_disposition_type=disposition,
+        headers={'Cache-Control': 'private, max-age=600'},
+    )
+
+
+@router.delete('/api/upload')
+async def delete_upload(
+    request: Request,
+    id: str = Query(..., min_length=6, max_length=64),
+) -> dict[str, Any]:
+    """删除一个还没发出的附件（前端移除待发送项时调用）。"""
+    _guard_write(request)
+    if _uploads is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
+    removed = await asyncio.to_thread(_uploads.delete, id)
+    return {'ok': True, 'removed': removed}
+
+
+async def _upload_segment(
+    record: 'UploadRecord',
+) -> tuple[Any, dict[str, Any]]:
+    """把一条上传附件转成 ``(uniseg 段, 记录里的段字典)``。
+
+    图片按 ``Image`` 发（聊天里直接显示），其余按 ``File`` 发；两者都用文件
+    内容/路径而不是 URL：适配器把 ``Image(path=...)`` 转成 ``file://`` 只有
+    当它在同一台机器上时才读得到，而 ``raw=``（适配器会转成 ``base64://``）
+    在任何部署下都能用 —— 代价是传输体积涨三分之一，对附件这个量级可以接受。
+
+    ``File`` 段的 exporter 只认 ``path``（不认 ``raw``），所以文件走路径。
+
+    段里的 url 指向 ``/api/upload?id=...``：前端带令牌就能取回，因此**发出的
+    消息在记录里依然能显示图片**（附件被清理后才退化成占位）。
+    """
+    from nonebot_plugin_alconna.uniseg import File, Image
+
+    url = f'{cfg.botui_route}/api/upload?id={record.id}'
+    if record.kind == 'image':
+        data = await asyncio.to_thread(record.path.read_bytes)
+        seg: Any = Image(raw=data, name=record.name, mimetype=record.mime or None)
+        payload: dict[str, Any] = {
+            'type': 'image',
+            'url': url,
+            'name': record.name,
+            'mime': record.mime or None,
+        }
+    else:
+        seg = File(path=record.path, name=record.name, mimetype=record.mime or None)
+        payload = {
+            'type': 'file',
+            'url': url,
+            'name': record.name,
+            'mime': record.mime or None,
+            'size': record.size,
+        }
+    return seg, payload
+
+
+async def _resolve_upload(raw: Any) -> 'UploadRecord':
+    """按 id 取回附件，取不到时抛 404。"""
+    uid = str(raw or '').strip()
+    if _uploads is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
+    record = await asyncio.to_thread(_uploads.get, uid)
+    if record is None:
+        raise HTTPException(status_code=404, detail=f'附件 {uid or "?"} 不存在或已过期')
+    return record
+
+
+async def _send_via_bot(
+    bot: Bot,
+    chat: ChatRecord,
+    at_list,
+    text: str,
+    reply_to: str,
+    extra: list[Any] | None = None,
+):
+    """真正把消息发出去，返回回执。
+
+    ``extra`` 是夹在正文后面的附加消息段（图片 / 文件等），由调用方按发送顺序
+    排好；正文（@、文本）在前，附件在后，与常见聊天软件的排版一致。
+    """
     from nonebot_plugin_alconna.uniseg import At, Text, Reply, UniMessage
 
     outgoing: list[Any] = []
@@ -514,6 +692,8 @@ async def _send_via_bot(bot: Bot, chat: ChatRecord, at_list, text: str, reply_to
         outgoing.append(Text(' '))
     if text:
         outgoing.append(Text(text))
+    if extra:
+        outgoing.extend(extra)
 
     # 关闭采集再发送：下面会手工补一条记录（为了拿到行号返回给前端），
     # 不关闭的话采集钩子会重复记一条，界面上就会看到两条一样的消息。
@@ -539,13 +719,32 @@ async def post_send(request: Request) -> dict[str, Any]:
     text = str(payload.get('text') or '')
     at_list = [str(x) for x in (payload.get('at') or []) if str(x).strip()]
     reply_to = str(payload.get('reply_to') or '').strip()
+    upload_ids = [str(x) for x in (payload.get('uploads') or []) if str(x).strip()]
 
     if not key:
         raise HTTPException(status_code=400, detail='缺少 chat 参数')
-    if not text.strip() and not at_list:
+    if not text.strip() and not at_list and not upload_ids:
         raise HTTPException(status_code=400, detail='消息内容为空')
     if len(text) > 4000:
         raise HTTPException(status_code=400, detail='消息过长（最多 4000 字）')
+    if len(upload_ids) > MAX_UPLOADS_PER_MESSAGE:
+        raise HTTPException(
+            status_code=400, detail=f'一次最多发送 {MAX_UPLOADS_PER_MESSAGE} 个附件'
+        )
+    if upload_ids and not cfg.botui_upload_enabled:
+        raise HTTPException(status_code=403, detail='BotUI 未开启附件上传')
+
+    # 附件要在发送前取好：一是确认它们都还在（过期会 404），二是把 uniseg 段
+    # 提前构造出来。发送时附件排在正文之后。
+    extra: list[Any] = []
+    upload_segments: list[dict[str, Any]] = []
+    upload_records: list['UploadRecord'] = []
+    for uid in upload_ids:
+        item = await _resolve_upload(uid)
+        seg, seg_dict = await _upload_segment(item)
+        extra.append(seg)
+        upload_segments.append(seg_dict)
+        upload_records.append(item)
 
     chat = store.chat(key)
     if chat is None:
@@ -568,16 +767,25 @@ async def post_send(request: Request) -> dict[str, Any]:
         )
 
     try:
-        receipt = await _send_via_bot(bot, chat, at_list, text, reply_to)
+        receipt = await _send_via_bot(bot, chat, at_list, text, reply_to, extra)
     except Exception as e:
         logger.opt(exception=True).warning(f'BotUI failed to send message: {e}')
         raise HTTPException(status_code=502, detail=f'发送失败：{e}') from e
+
+    # 附件已经发出去了：延长它们的保留时间，别让聊天记录里的图片一小时后就坏掉
+    for item in upload_records:
+        await asyncio.to_thread(_mark_upload_used, item.id)
 
     # 主动补一条记录：即使采集钩子因故没生效，WebUI 里也能看到
     record = build_outgoing(
         chat,
         await _payload_segments(
-            at_list, text, reply_to, store=store, chat_key=chat.key
+            at_list,
+            text,
+            reply_to,
+            store=store,
+            chat_key=chat.key,
+            extra=upload_segments,
         ),
         text,
         self_id=str(bot.self_id),
@@ -588,6 +796,13 @@ async def post_send(request: Request) -> dict[str, Any]:
     # 等待落库：既保证下面的返回值带有真实行号，也让增量事件先推出去
     await store.flush()
     return {'ok': True, 'message': record.to_dict()}
+
+
+def _mark_upload_used(uid: str) -> None:
+    """把附件标记为已发出（拿不到上传存储时静默跳过）。"""
+    if _uploads is None:  # pragma: no cover - setup 一定会注入
+        return
+    _uploads.mark_used(uid)
 
 
 async def _quoted_segment(store: 'MessageStore', message_id: str) -> dict[str, Any]:
@@ -619,8 +834,13 @@ async def _payload_segments(
     reply_to: str = '',
     store: 'MessageStore | None' = None,
     chat_key: str = '',
+    extra: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
-    """把 WebUI 的发送内容转成用于记录的消息段"""
+    """把 WebUI 的发送内容转成用于记录的消息段
+
+    ``extra`` 是附件（图片 / 文件）的段字典，顺序与下面 uniseg 的发送顺序一致：
+    引用、@、正文，最后是附件。
+    """
     segments: list[dict[str, Any]] = []
     if reply_to and store is not None:
         segments.append(await _quoted_segment(store, reply_to))
@@ -636,6 +856,8 @@ async def _payload_segments(
         segments.append({'type': 'text', 'text': ' '})
     if text:
         segments.append({'type': 'text', 'text': text})
+    if extra:
+        segments.extend(extra)
     return segments
 
 

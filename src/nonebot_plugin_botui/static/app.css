@@ -887,6 +887,66 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 .at-chip button { color: inherit; font-size: 11px; opacity: 0.75; }
 .at-chip button:hover { opacity: 1; }
 
+/* ---------- 待发送附件 ---------- */
+.pending-files { display: flex; flex-wrap: wrap; gap: 6px; }
+.file-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 240px;
+  font-size: 12px;
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 3px 6px 3px 8px;
+}
+.file-chip.image { padding-left: 3px; }
+.file-chip-thumb {
+  width: 26px;
+  height: 26px;
+  border-radius: 5px;
+  object-fit: cover;
+  flex: none;
+}
+.file-chip-badge {
+  flex: none;
+  font-size: 11px;
+  color: var(--accent-text);
+  background: var(--accent-soft);
+  border-radius: 5px;
+  padding: 2px 5px;
+}
+.file-chip-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+.file-chip-size { flex: none; color: var(--muted); font-size: 11px; }
+.file-chip button { color: var(--muted); font-size: 11px; flex: none; }
+.file-chip button:hover { color: var(--text); }
+
+/* ---------- 拖拽文件提示层 ---------- */
+.drop-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: rgba(0, 0, 0, 0.42);
+  pointer-events: none;
+}
+.drop-overlay-card {
+  padding: 16px 22px;
+  border-radius: var(--radius);
+  background: var(--panel);
+  border: 2px dashed var(--accent);
+  color: var(--text);
+  font-size: 14px;
+}
+
 .composer-row { display: flex; align-items: flex-end; gap: 8px; }
 
 .composer-tool {

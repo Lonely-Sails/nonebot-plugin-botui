@@ -89,6 +89,8 @@ const state = {
 
   replyTo: null,            // 待回复消息
   pendingAt: [],            // 待发送的 @ 目标
+  pendingFiles: [],         // 待发送的附件（已上传，元素形如 {id,name,size,mime,kind}）
+  uploading: 0,             // 正在上传的附件数（>0 时发送按钮提示「上传中」）
   members: [],              // 当前会话记录到过的成员（@ 菜单数据源）
   memberMap: new Map(),     // 成员 id -> 成员（用于把 @ 显示成昵称）
   atQuery: '',              // @ 菜单的搜索词
@@ -131,8 +133,11 @@ const el = {
   replyBarLabel: $('replyBarLabel'),
   replyBarClose: $('replyBarClose'),
   pendingAt: $('pendingAt'),
+  pendingFiles: $('pendingFiles'),
   atBtn: $('atBtn'),
   atMenu: $('atMenu'),
+  fileBtn: $('fileBtn'),
+  filePicker: $('filePicker'),
   input: $('composerInput'),
   sendBtn: $('sendBtn'),
   hint: $('composerHint'),
@@ -145,6 +150,7 @@ const el = {
   fileViewerClose: $('fileViewerClose'),
   fileViewerSave: $('fileViewerSave'),
   ctxMenu: $('ctxMenu'),
+  dropOverlay: $('dropOverlay'),
   gate: $('gate'),
   gateForm: $('gateForm'),
   gateInput: $('gateInput'),
@@ -166,7 +172,51 @@ function h(tag, className, text) {
 function safeUrl(url) {
   if (typeof url !== 'string') return '';
   const trimmed = url.trim();
+  // 自己上传的附件存的是服务端相对路径（/botui/api/upload?id=...），同源可信
+  if (isOwnUrl(trimmed)) return trimmed;
   return /^https?:\/\//i.test(trimmed) ? trimmed : '';
+}
+
+/** 判断是不是本插件自己的接口地址（上传的附件就走这个） */
+function isOwnUrl(url) {
+  return typeof url === 'string' && url.indexOf(ROOT_BASE + '/api/') === 0;
+}
+
+/** 接口地址的鉴权参数（<img>/<a>/<video> 带不上自定义请求头，只能走 query） */
+function tokenQuery() {
+  return state.token ? 'token=' + encodeURIComponent(state.token) : '';
+}
+
+/**
+ * 自己上传的附件地址：补上令牌（可选下载参数）后可直接作为资源地址使用。
+ * 不是本插件接口地址时返回空串。
+ */
+function ownUrl(raw, download) {
+  const url = String(raw || '').trim();
+  if (!isOwnUrl(url)) return '';
+  const parts = [];
+  if (url.indexOf('token=') < 0) {
+    const token = tokenQuery();
+    if (token) parts.push(token);
+  }
+  if (download) parts.push('download=1');
+  if (!parts.length) return url;
+  return url + (url.indexOf('?') >= 0 ? '&' : '?') + parts.join('&');
+}
+
+/** 从 /api/upload?id=... 里取出附件 id（不是本插件地址时返回空串） */
+function ownUploadId(raw) {
+  const url = String(raw || '');
+  if (!isOwnUrl(url)) return '';
+  const query = url.indexOf('?') >= 0 ? url.slice(url.indexOf('?') + 1) : '';
+  for (const part of query.split('&')) {
+    const eq = part.indexOf('=');
+    if (eq < 0) continue;
+    if (part.slice(0, eq) === 'id') {
+      try { return decodeURIComponent(part.slice(eq + 1)); } catch { return ''; }
+    }
+  }
+  return '';
 }
 
 /** 鉴权参数：图片/文件走 <img>/<a>/<audio> 直接发请求，带不上自定义请求头 */
@@ -176,6 +226,9 @@ function authQuery() {
 
 /** 媒体代理地址：远程图片大多带防盗链，直连会加载失败，统一走后端代理 */
 function proxied(raw) {
+  // 自己上传的附件本来就在服务端，直接取（再套一层代理反而多余）
+  const own = ownUrl(raw);
+  if (own) return own;
   const url = safeUrl(raw);
   if (!url) return '';
   return ROOT_BASE + '/media?u=' + encodeURIComponent(url) + authQuery();
@@ -183,6 +236,9 @@ function proxied(raw) {
 
 /** 文件地址：走 /api/file 代理（QQ 文件直链往往需要鉴权，且要支持 Range） */
 function fileUrl(raw, name, download) {
+  // 上传的附件走 /api/upload，它自带 Content-Disposition 与 Range 支持
+  const own = ownUrl(raw, download);
+  if (own) return own;
   const url = safeUrl(raw);
   const parts = [];
   if (url) parts.push('u=' + encodeURIComponent(url));
@@ -416,6 +472,44 @@ async function api(path, options) {
   return data === null ? {} : data;
 }
 
+/**
+ * 上传二进制内容的请求封装（附件走这里）。
+ *
+ * 与 :func:`api` 的区别只在请求体：附件是原始字节流而非 JSON，所以这里直接
+ * 把 ``ArrayBuffer`` 放进 body，文件名/类型走查询参数（后端也据此读取，不需要
+ * multipart 依赖）。返回与错误处理逻辑与 ``api`` 保持一致。
+ */
+async function apiBytes(path, method, buffer) {
+  const headers = { 'X-BotUI-Token': state.token || '' };
+  let res;
+  try {
+    res = await fetch(API_BASE + path, {
+      method: method || 'POST',
+      headers: headers,
+      body: buffer,
+      cache: 'no-store',
+      credentials: 'same-origin'
+    });
+  } catch (err) {
+    const netErr = new Error('无法连接服务器');
+    netErr.status = 0;
+    throw netErr;
+  }
+  const raw = await res.text().catch(() => '');
+  let data = null;
+  if (raw) {
+    try { data = JSON.parse(raw); } catch (err) { data = null; }
+  }
+  if (!res.ok) {
+    if (res.status === 401) requireToken();
+    const message = (data && hasText(data.error)) ? String(data.error) : ('上传失败（HTTP ' + res.status + '）');
+    const httpErr = new Error(message);
+    httpErr.status = res.status;
+    throw httpErr;
+  }
+  return data === null ? {} : data;
+}
+
 /* ============================ 4. 启动流程 ============================ */
 
 /** 读取 ?token=，写入 localStorage，并从地址栏抹掉 */
@@ -580,10 +674,14 @@ async function loadMeta() {
 function applyMeta() {
   const meta = state.meta || {};
   const writable = meta.write_enabled !== false;
+  // 附件开关随「只读模式」一起失效：只读时连输入框都不给用，更不该能发文件
+  const canUpload = writable && meta.upload_enabled !== false;
 
   el.input.disabled = !writable;
   el.sendBtn.disabled = !writable;
   el.atBtn.disabled = !writable;
+  el.fileBtn.disabled = !canUpload;
+  el.fileBtn.title = canUpload ? '发送图片 / 文件' : '未开启附件发送';
   el.composer.classList.toggle('readonly', !writable);
   el.input.placeholder = writable ? '输入消息，Enter 发送，Shift+Enter 换行' : '只读模式，无法发送消息';
   el.hint.textContent = writable ? '' : '只读模式';
@@ -1651,6 +1749,9 @@ async function openChat(key) {
   state.newCount = 0;
   state.replyTo = null;
   state.pendingAt = [];
+  // 待发送的附件属于「上一个会话」：切换会话时清空本地列表（服务端那份留着，
+  // 会由定时清理回收），避免误发到别的会话
+  state.pendingFiles = [];
   state.members = [];
   state.memberMap.clear();
   closeAtMenu();
@@ -1660,6 +1761,7 @@ async function openChat(key) {
   renderHead();
   renderReplyBar();
   renderPendingAt();
+  renderPendingFiles();
   renderMessageSkeleton();
   updateNewMsgButton();
 
@@ -1749,14 +1851,17 @@ async function sendMessage() {
   const chat = state.current;
   if (!chat || state.sending) return;
   if (state.meta && state.meta.write_enabled === false) { toast('只读模式，无法发送消息', true); return; }
+  if (state.uploading) { toast('还有附件正在上传，稍等一下', true); return; }
 
   const text = el.input.value.replace(/\s+$/, '');
   const at = state.pendingAt.slice();
-  if (!text && !at.length) return;
+  const files = state.pendingFiles.slice();
+  if (!text && !at.length && !files.length) return;
 
   const reply = state.replyTo;
   const body = { chat: chat.key, text: text };
   if (at.length) body.at = at;
+  if (files.length) body.uploads = files.map((f) => f.id);
   if (reply && hasText(reply.message_id)) body.reply_to = String(reply.message_id);
 
   state.sending = true;
@@ -1770,8 +1875,10 @@ async function sendMessage() {
     autoGrow();
     state.replyTo = null;
     state.pendingAt = [];
+    state.pendingFiles = [];
     renderReplyBar();
     renderPendingAt();
+    renderPendingFiles();
 
     if (msg && hasText(msg.chat) && String(msg.chat) === chat.key) {
       appendMessage(msg);
@@ -1878,6 +1985,113 @@ function addAt(id, name) {
   if (name) state.memberMap.set(value, { id: value, name: String(name) });
   if (state.pendingAt.indexOf(value) < 0) state.pendingAt.push(value);
   renderPendingAt();
+}
+
+/* ---------- 待发送附件 ----------
+   选中的图片/文件先上传到服务端（返回 id），发送时只带 id 列表。这么拆是为了
+   能在发送前显示缩略图 / 文件名，也避免把文件字节塞进发送请求体。
+   移除待发送项时顺带把服务端那份也删掉，不占磁盘。 */
+
+function canUpload() {
+  const meta = state.meta || {};
+  return meta.write_enabled !== false && meta.upload_enabled !== false;
+}
+
+function renderPendingFiles() {
+  const box = el.pendingFiles;
+  box.textContent = '';
+  if (!state.pendingFiles.length) { box.hidden = true; return; }
+  box.hidden = false;
+  state.pendingFiles.forEach((item) => {
+    const chip = h('span', 'file-chip' + (item.kind === 'image' ? ' image' : ''));
+    if (item.kind === 'image' && item.url) {
+      const img = document.createElement('img');
+      img.className = 'file-chip-thumb';
+      img.alt = item.name;
+      img.src = item.url;
+      chip.appendChild(img);
+    } else {
+      chip.appendChild(h('span', 'file-chip-badge', fileKind(item.name, item.mime)));
+    }
+    chip.appendChild(h('span', 'file-chip-name', item.name));
+    const size = formatBytes(Number(item.size));
+    if (size) chip.appendChild(h('span', 'file-chip-size', size));
+
+    const remove = h('button', null, '✕');
+    remove.type = 'button';
+    remove.title = '移除该附件';
+    remove.addEventListener('click', () => removePendingFile(item.id));
+    chip.appendChild(remove);
+    box.appendChild(chip);
+  });
+}
+
+function addPendingFile(item) {
+  if (!item || !hasText(item.id)) return;
+  if (state.pendingFiles.some((f) => f.id === item.id)) return;
+  item.url = ROOT_BASE + '/api/upload?id=' + encodeURIComponent(String(item.id)) + authQuery();
+  state.pendingFiles.push(item);
+  renderPendingFiles();
+}
+
+function removePendingFile(id) {
+  const keep = state.pendingFiles.filter((f) => f.id !== id);
+  if (keep.length === state.pendingFiles.length) return;
+  state.pendingFiles = keep;
+  renderPendingFiles();
+  // 服务端那份也删掉；删不掉（已过期）不影响界面，静默即可
+  api('/upload?id=' + encodeURIComponent(String(id)), { method: 'DELETE' }).catch(() => {});
+}
+
+/** 上传一个本地文件（File / Blob），成功后加入待发送列表 */
+async function uploadFile(file) {
+  if (!file) return;
+  const meta = state.meta || {};
+  const limit = Number(meta.upload_max_bytes);
+  if (Number.isFinite(limit) && limit > 0 && file.size > limit) {
+    toast('「' + (file.name || '文件') + '」超过大小上限（' + formatBytes(limit) + '）', true);
+    return;
+  }
+  const name = hasText(file.name) ? String(file.name) : ('file-' + Date.now());
+  const type = hasText(file.type) ? String(file.type) : '';
+  const query = '?name=' + encodeURIComponent(name) + (type ? '&type=' + encodeURIComponent(type) : '');
+  state.uploading += 1;
+  updateSendButtonHint();
+  setStatus('poll', '正在上传附件…');
+  try {
+    const raw = await file.arrayBuffer();
+    const data = await apiBytes('/upload' + query, 'POST', raw);
+    if (data && data.file) {
+      addPendingFile(data.file);
+      toast('已添加附件：' + (data.file.name || name));
+    }
+  } catch (err) {
+    if (!err || err.status !== 401) toast(err && err.message ? err.message : '上传失败', true);
+  } finally {
+    state.uploading = Math.max(0, state.uploading - 1);
+    updateSendButtonHint();
+    if (!state.uploading && state.started && state.online) statusOk();
+  }
+}
+
+/** 批量上传本地文件/图片并加入待发送列表 */
+async function uploadFiles(list) {
+  if (!canUpload()) {
+    toast(state.meta && state.meta.write_enabled === false ? '只读模式，无法发送附件' : '未开启附件发送', true);
+    return;
+  }
+  const items = Array.from(list || []);
+  if (!items.length) return;
+  for (const file of items) {
+    // 串行上传：并发太多在弱网下更容易失败，而且顺序对小图也更友好
+    await uploadFile(file);
+  }
+}
+
+/** 上传过程中把发送按钮的提示文字改一下，避免用户以为卡住了 */
+function updateSendButtonHint() {
+  if (state.sending) return;
+  el.sendBtn.textContent = state.uploading ? '上传中' : '发送';
 }
 
 /* ---------- @ 成员选择菜单 ----------
@@ -2056,6 +2270,13 @@ function closeFileViewer() {
   el.fileViewerSave.removeAttribute('href');
 }
 
+/** 读取自己上传的文本附件内容（浏览器会按响应头/嗅探猜编码） */
+async function fetchOwnText(url) {
+  const res = await fetch(url, { cache: 'no-store', credentials: 'same-origin' });
+  if (!res.ok) throw new Error('读取失败（HTTP ' + res.status + '）');
+  return await res.text();
+}
+
 async function openFilePreview(seg) {
   const name = fileNameOf(seg);
   const kind = previewKind(name, fileMimeOf(seg));
@@ -2075,6 +2296,15 @@ async function openFilePreview(seg) {
     const box = h('pre', 'file-text', '');
     el.fileViewerBody.appendChild(box);
     try {
+      // 自己上传的附件直接读原始内容（/api/preview 只认远程 http 链接），
+      // 其余仍交给后端的文本预览接口（它会只取前 512 KB 并给出编码判断）
+      if (isOwnUrl(seg.url)) {
+        const text = await fetchOwnText(ownUrl(seg.url));
+        if (seq !== state.fileSeq || el.fileViewer.hidden) return;
+        box.textContent = text;
+        el.fileViewerMeta.textContent = fileMimeOf(seg) || '';
+        return;
+      }
       const query = 'name=' + encodeURIComponent(name)
         + '&u=' + encodeURIComponent(safeUrl(seg.url) || String(seg.url || ''))
         + (state.current && state.current.key ? '&chat=' + encodeURIComponent(state.current.key) : '');
@@ -2767,6 +2997,35 @@ function bindEvents() {
   });
   el.sendBtn.addEventListener('click', sendMessage);
 
+  // 附件：点按钮选文件，或直接把文件拖进页面 / 粘贴
+  el.fileBtn.addEventListener('click', () => {
+    if (!canUpload()) { toast('未开启附件发送', true); return; }
+    el.filePicker.click();
+  });
+  el.filePicker.addEventListener('change', () => {
+    // 必须先快照成数组再清空 value：FileList 是实时对象，value='' 会把列表一起清空，
+    // 直接传 el.filePicker.files 的话会让上传拿到一个空列表（表现为选了文件没任何反应）。
+    const files = Array.from(el.filePicker.files || []);
+    el.filePicker.value = '';  // 清空，方便连续选同一个文件
+    uploadFiles(files);
+  });
+  el.input.addEventListener('paste', (ev) => {
+    if (!canUpload()) return;
+    const items = ev.clipboardData ? ev.clipboardData.items : null;
+    if (!items) return;
+    const picked = [];
+    for (const item of items) {
+      if (item.kind === 'file') {
+        const file = item.getAsFile();
+        if (file) picked.push(file);
+      }
+    }
+    if (picked.length) {
+      ev.preventDefault();
+      uploadFiles(picked);
+    }
+  });
+
   // 回复条 / @
   el.replyBarClose.addEventListener('click', () => setReply(null));
   el.atBtn.addEventListener('click', toggleAtMenu);
@@ -2815,6 +3074,38 @@ function bindEvents() {
   });
   window.addEventListener('resize', () => { closeAtMenu(); closeCtxMenu(); closeBotMenu(); });
   window.addEventListener('blur', () => { closeCtxMenu(); closeBotMenu(); });
+
+  // 拖拽文件到窗口任意位置：显示提示层，松手后上传。
+  // dragenter/dragleave 会在子元素间反复触发，所以用一个计数器判断是否仍在窗口内。
+  let dragDepth = 0;
+  const hasFiles = (ev) => {
+    const types = ev.dataTransfer ? ev.dataTransfer.types : null;
+    return !!types && Array.prototype.indexOf.call(types, 'Files') >= 0;
+  };
+  document.addEventListener('dragenter', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth += 1;
+    if (canUpload()) el.dropOverlay.hidden = false;
+  });
+  document.addEventListener('dragover', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();  // 不阻止的话浏览器会直接打开文件
+    if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+  });
+  document.addEventListener('dragleave', (ev) => {
+    if (!hasFiles(ev)) return;
+    dragDepth = Math.max(0, dragDepth - 1);
+    if (!dragDepth) el.dropOverlay.hidden = true;
+  });
+  document.addEventListener('drop', (ev) => {
+    if (!hasFiles(ev)) return;
+    ev.preventDefault();
+    dragDepth = 0;
+    el.dropOverlay.hidden = true;
+    const files = ev.dataTransfer ? ev.dataTransfer.files : null;
+    uploadFiles(files);
+  });
 
   // 页面重新可见时补一次同步：后台标签页的定时器会被浏览器节流，
   // 长连接也可能已经被中间设备掐掉，回来先对齐再继续。
