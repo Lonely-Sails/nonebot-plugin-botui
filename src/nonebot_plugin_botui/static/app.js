@@ -187,14 +187,20 @@ function h(tag, className, text) {
 function safeUrl(url) {
   if (typeof url !== 'string') return '';
   const trimmed = url.trim();
-  // 自己上传的附件存的是服务端相对路径（/botui/api/upload?id=...），同源可信
+  // 本插件自己的媒体地址是服务端相对路径（/botui/api/media/<id>），同源可信
   if (isOwnUrl(trimmed)) return trimmed;
   return /^https?:\/\//i.test(trimmed) ? trimmed : '';
 }
 
-/** 判断是不是本插件自己的接口地址（上传的附件就走这个） */
+/**
+ * 判断是不是本插件自己的媒体取回地址（``/api/media/<id>``）。
+ *
+ * 必须收紧到这个白名单 —— 早先写成「任何 ``/api/`` 开头」，结果像
+ * ``/api/settings`` 这类接口地址也会被当成图片直链拿去 ``<img src>``。
+ */
 function isOwnUrl(url) {
-  return typeof url === 'string' && url.indexOf(ROOT_BASE + '/api/') === 0;
+  if (typeof url !== 'string') return false;
+  return url.indexOf(ROOT_BASE + '/api/media/') === 0;
 }
 
 /** 接口地址的鉴权参数（<img>/<a>/<video> 带不上自定义请求头，只能走 query） */
@@ -219,21 +225,6 @@ function ownUrl(raw, download) {
   return url + (url.indexOf('?') >= 0 ? '&' : '?') + parts.join('&');
 }
 
-/** 从 /api/upload?id=... 里取出附件 id（不是本插件地址时返回空串） */
-function ownUploadId(raw) {
-  const url = String(raw || '');
-  if (!isOwnUrl(url)) return '';
-  const query = url.indexOf('?') >= 0 ? url.slice(url.indexOf('?') + 1) : '';
-  for (const part of query.split('&')) {
-    const eq = part.indexOf('=');
-    if (eq < 0) continue;
-    if (part.slice(0, eq) === 'id') {
-      try { return decodeURIComponent(part.slice(eq + 1)); } catch { return ''; }
-    }
-  }
-  return '';
-}
-
 /** 鉴权参数：图片/文件走 <img>/<a>/<audio> 直接发请求，带不上自定义请求头 */
 function authQuery() {
   return state.token ? '&token=' + encodeURIComponent(state.token) : '';
@@ -251,7 +242,7 @@ function proxied(raw) {
 
 /** 文件地址：走 /api/file 代理（QQ 文件直链往往需要鉴权，且要支持 Range） */
 function fileUrl(raw, name, download) {
-  // 上传的附件走 /api/upload，它自带 Content-Disposition 与 Range 支持
+  // 媒体库地址直接取，它自带 Content-Disposition 与 Range 支持
   const own = ownUrl(raw, download);
   if (own) return own;
   const url = safeUrl(raw);
@@ -935,10 +926,10 @@ async function loadBots() {
   }
 }
 
-/* ====================== 4c. 设置面板（缓存管理） ======================
-   机器人收到的图片/文件会在服务端落盘缓存（见后端 filecache.py），右上角
-   的入口用来查看占用并清理。缓存清理是不可撤销的删除动作，所有操作都要
-   用户显式点按钮，不做自动清理之外的任何隐式删除。 */
+/* ====================== 4c. 设置面板（媒体库管理） ======================
+   机器人收发的图片/文件、WebUI 上传的附件都在服务端媒体库里（见后端
+   mediastore.py），右上角的入口用来查看占用并清理。清理是不可撤销的删除
+   动作，所有操作都要用户显式点按钮，不做自动清理之外的任何隐式删除。 */
 
 function cacheEnabled() {
   return !!(state.meta && state.meta.cache_enabled);
@@ -1606,8 +1597,8 @@ function buildMediaPlayer(seg, kind) {
   player.controls = true;
   player.preload = 'metadata';
   if (kind === 'video') player.playsInline = true;
-  // 走 /api/file 而不是 /api/media：媒体要支持 Range（拖进度条），
-  // /api/media 是整段读取且有体积上限，只适合图片。
+  // 统一走 /api/file：媒体库副本命中时它直接回本地文件，未命中则代理原链接，
+  // 两条路径都带 Range 支持（音视频拖进度条靠它）。
   player.src = fileUrl(seg.url, fileNameOf(seg), false);
   player.addEventListener('error', () => {
     if (!player.parentNode) return;
@@ -2237,7 +2228,9 @@ function renderPendingFiles() {
 function addPendingFile(item) {
   if (!item || !hasText(item.id)) return;
   if (state.pendingFiles.some((f) => f.id === item.id)) return;
-  item.url = ROOT_BASE + '/api/upload?id=' + encodeURIComponent(String(item.id)) + authQuery();
+  // 与服务端、与消息段里用的是同一个取回地址，随手动带上令牌
+  const base = ROOT_BASE + '/api/media/' + encodeURIComponent(String(item.id));
+  item.url = ownUrl(base);
   state.pendingFiles.push(item);
   renderPendingFiles();
 }
@@ -2248,7 +2241,7 @@ function removePendingFile(id) {
   state.pendingFiles = keep;
   renderPendingFiles();
   // 服务端那份也删掉；删不掉（已过期）不影响界面，静默即可
-  api('/upload?id=' + encodeURIComponent(String(id)), { method: 'DELETE' }).catch(() => {});
+  api('/media/' + encodeURIComponent(String(id)), { method: 'DELETE' }).catch(() => {});
 }
 
 /** 上传一个本地文件（File / Blob），成功后加入待发送列表 */

@@ -23,19 +23,14 @@ from pathlib import Path
 
 from nonebot_plugin_localstore import (
     get_plugin_data_dir,
-    get_plugin_cache_dir,
     get_plugin_data_file,
 )
 
 #: 插件数据目录（localstore 的目录函数自带 mkdir，这里不必再补）
 DATA_DIR: Path = get_plugin_data_dir()
-#: 插件缓存目录（可被删的派生数据都放这里，见 filecache.py）
-CACHE_DIR: Path = get_plugin_cache_dir()
 #: SQLite 数据库文件
 DB_FILE: Path = get_plugin_data_file('botui.sqlite3')
 #: 自动生成的访问令牌文件
 TOKEN_FILE: Path = get_plugin_data_file('token.txt')
-#: WebUI 里上传、等待发送的附件目录（每个附件一个子目录，见 uploads.py）
-UPLOAD_DIR: Path = DATA_DIR / 'uploads'
-#: 收到的图片/文件缓存目录（每个资源一个子目录，见 filecache.py）
-FILE_CACHE_DIR: Path = CACHE_DIR / 'files'
+#: 媒体库目录：机器人收到的、WebUI 上传的图片/文件都在这里（见 mediastore.py）
+BLOB_DIR: Path = DATA_DIR / 'blobs'

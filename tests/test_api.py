@@ -848,10 +848,10 @@ async def test_upload_rejects_empty_body(client: AsyncClient, seeded):
 async def test_upload_rejects_too_large(
     client: AsyncClient, seeded, monkeypatch: pytest.MonkeyPatch
 ):
-    """超过 BOTUI_UPLOAD_MAX_BYTES 的附件在写盘前就被拦下。"""
+    """超过 BOTUI_MEDIA_FILE_MAX_BYTES 的附件在写盘前就被拦下。"""
     from src.nonebot_plugin_botui import api
 
-    monkeypatch.setattr(api.cfg, 'botui_upload_max_bytes', 4)
+    monkeypatch.setattr(api.cfg, 'botui_media_file_max_bytes', 4)
     resp = await client.post(
         '/botui/api/upload?name=a.bin', headers=HEADERS, content=b'12345678'
     )
@@ -871,30 +871,30 @@ async def test_upload_then_fetch_and_delete(client: AsyncClient, botui, seeded):
     assert info['kind'] == 'image'
     assert info['size'] == len(_PNG)
 
-    got = await client.get(f"/botui/api/upload?id={info['id']}", headers=HEADERS)
+    got = await client.get(f"/botui/api/media/{info['id']}", headers=HEADERS)
     assert got.status_code == 200
     assert got.content == _PNG
     assert got.headers['content-type'].startswith('image/png')
 
     # 鉴权同样是硬要求：图片是 <img src> 直接取的，只能靠 query
-    assert (await client.get(f"/botui/api/upload?id={info['id']}")).status_code == 401
+    assert (await client.get(f"/botui/api/media/{info['id']}")).status_code == 401
 
     rm = await client.request(
-        'DELETE', f"/botui/api/upload?id={info['id']}", headers=HEADERS
+        'DELETE', f"/botui/api/media/{info['id']}", headers=HEADERS
     )
     assert rm.status_code == 200
     assert rm.json()['removed'] is True
     assert (
-        await client.get(f"/botui/api/upload?id={info['id']}", headers=HEADERS)
+        await client.get(f"/botui/api/media/{info['id']}", headers=HEADERS)
     ).status_code == 404
 
 
 async def test_upload_rejects_path_traversal(client: AsyncClient, seeded):
     """id 里带路径分隔符一律拒绝，避免变成读文件接口。"""
     for uid in ('../../etc/passwd', 'a/b', '..'):
-        resp = await client.get(f'/botui/api/upload?id={uid}', headers=HEADERS)
-        # FastAPI 的 Query(min_length=6) 会先挡掉太短的，其余由 uploads 校验拦截
-        assert resp.status_code in (400, 404, 422), uid
+        resp = await client.get(f'/botui/api/media/{uid}', headers=HEADERS)
+        # 含分隔符的路由不匹配、其余由媒体库的 id 校验拦截，都是 404
+        assert resp.status_code == 404, uid
 
 
 async def test_send_image_attachment(client: AsyncClient, botui, seeded):
@@ -929,7 +929,8 @@ async def test_send_image_attachment(client: AsyncClient, botui, seeded):
 
     image = next(s for s in body['message']['segments'] if s['type'] == 'image')
     assert image['name'] == 'pic.png'
-    assert image['url'].startswith('/botui/api/upload?id=')
+    # 段里的地址指向媒体库：这就是「自己发的图也能在记录里显示」的落点
+    assert image['url'].startswith('/botui/api/media/')
     await store.flush()
 
 
@@ -959,7 +960,8 @@ async def test_send_file_attachment(client: AsyncClient, botui, seeded):
     api_name, payload = calls[-1]
     assert api_name == 'upload_group_file'
     assert payload['name'] == '报告.txt'
-    assert payload['file'].endswith('blob')
+    # 落盘用的是原始文件名（QQ 适配器取磁盘名，叫 blob 对方就收到「未命名」）
+    assert payload['file'].endswith('报告.txt')
 
     file_seg = next(s for s in body['message']['segments'] if s['type'] == 'file')
     assert file_seg['name'] == '报告.txt'
@@ -999,7 +1001,7 @@ async def test_send_rejects_uploads_when_disabled(
 ):
     from src.nonebot_plugin_botui import api
 
-    monkeypatch.setattr(api.cfg, 'botui_upload_enabled', False)
+    monkeypatch.setattr(api.cfg, 'botui_media_enabled', False)
     resp = await client.post(
         '/botui/api/send',
         headers=HEADERS,
@@ -1013,71 +1015,6 @@ async def test_meta_reports_upload_capability(client: AsyncClient, seeded):
     assert meta['upload_enabled'] is True
     assert meta['capabilities']['upload'] is True
     assert meta['upload_max_bytes'] > 0
-
-
-async def test_cleanup_removes_expired_uploads(tmp_path):
-    """过期附件由 cleanup 回收：没发出的按 ttl，发出的按 retention。"""
-    import json
-    import time
-
-    from src.nonebot_plugin_botui.uploads import UploadStore
-
-    store = UploadStore(tmp_path, ttl=3600.0, retention=3600.0)
-    fresh = store.save(b'hello', 'a.txt')
-    used = store.save(b'world', 'b.txt')
-    store.mark_used(used.id)
-    assert store.get(fresh.id) is not None
-
-    # 把两条附件的「过期时刻」手动拨到过去，避免依赖真实等待时间
-    past = time.time() - 10
-    for uid in (fresh.id, used.id):
-        meta_file = tmp_path / uid / 'meta.json'
-        meta = json.loads(meta_file.read_text(encoding='utf-8'))
-        meta['expires'] = past
-        if meta.get('used'):
-            # 已发出的按 used_at + retention 判断，这里把发出时间也推到过去
-            meta['used_at'] = past - store.retention - 10
-        meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
-
-    removed = store.cleanup()
-    # 没发出的过期了，已发出的也过了 retention，两条都该清掉
-    assert removed == 2
-    assert store.get(fresh.id) is None
-    assert store.get(used.id) is None
-
-
-async def test_used_upload_survives_ttl(tmp_path):
-    """已发出的附件不应按 ttl 过期：否则发出后一小时聊天记录里的图就坏了。"""
-    import json
-    import time
-
-    from src.nonebot_plugin_botui.uploads import UploadStore
-
-    store = UploadStore(tmp_path, ttl=3600.0, retention=99999.0)
-    used = store.save(b'world', 'b.txt')
-    store.mark_used(used.id)
-    meta_file = tmp_path / used.id / 'meta.json'
-    meta = json.loads(meta_file.read_text(encoding='utf-8'))
-    meta['expires'] = time.time() - 10
-    meta_file.write_text(json.dumps(meta, ensure_ascii=False), encoding='utf-8')
-
-    assert store.get(used.id) is not None
-    assert store.cleanup() == 0
-    assert store.get(used.id) is not None
-
-
-async def test_upload_filename_is_sanitized(tmp_path):
-    """浏览器给的名字可能带路径，落盘时必须只保留基名。"""
-    from src.nonebot_plugin_botui.uploads import UploadStore, safe_filename
-
-    assert safe_filename('C:\\Users\\a\\图片.png') == '图片.png'
-    assert safe_filename('../../etc/passwd') == 'passwd'
-    assert safe_filename('') == 'file'
-
-    store = UploadStore(tmp_path, ttl=3600)
-    record = store.save(b'x', '../../evil.sh')
-    assert record.name == 'evil.sh'
-    assert record.path.parent.parent == tmp_path
 
 
 # ── 撤回 ────────────────────────────────────────────────────────────────

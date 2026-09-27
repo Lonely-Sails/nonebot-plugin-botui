@@ -27,16 +27,20 @@ require('nonebot_plugin_apscheduler')
 
 from nonebot_plugin_apscheduler import scheduler
 
-from .paths import DB_FILE, TOKEN_FILE, UPLOAD_DIR, FILE_CACHE_DIR
+from .paths import (
+    DB_FILE,
+    BLOB_DIR,
+    TOKEN_FILE,
+)
 from .store import MessageStore
 from .webui import WebUIServer
 from .config import Config
 from .config import plugin_config as cfg
+from .ingest import ingest_message
 from .models import MessageRecord
 from .capture import setup as setup_capture
 from .capture import store_ref, register_hooks
-from .uploads import UploadStore
-from .filecache import FileCache
+from .mediastore import MediaStore
 
 __plugin_meta__ = PluginMetadata(
     name='BotUI 控制台',
@@ -61,10 +65,11 @@ driver = get_driver()
 # ── 运行时状态（首次用到时创建） ────────────────────────────────────────
 _store: MessageStore | None = None
 _server: WebUIServer | None = None
-_uploads: UploadStore | None = None
-_cache: FileCache | None = None
+_media: MediaStore | None = None
 _token: str = ''
 _hooks_ready = False
+#: 后台任务（媒体抓取）持有引用，避免中途被 GC 回收
+_bg_tasks: set[asyncio.Task] = set()
 
 
 def _load_token() -> str:
@@ -91,14 +96,33 @@ def _load_token() -> str:
     return token
 
 
+def _get_media() -> MediaStore:
+    """插件唯一的媒体库（收到的媒体与上传的附件都在这里，见 mediastore.py）。"""
+    global _media
+    if _media is None:
+        _media = MediaStore(
+            BLOB_DIR,
+            max_bytes=cfg.botui_media_max_bytes if cfg.botui_media_enabled else 0,
+            max_files=cfg.botui_media_max_files if cfg.botui_media_enabled else 0,
+            ttl=cfg.botui_media_ttl,
+            retention=cfg.botui_media_retention,
+            file_max_bytes=cfg.botui_media_file_max_bytes,
+        )
+    return _media
+
+
 def _get_store() -> MessageStore:
     global _store, _hooks_ready
     if _store is None:
         _store = MessageStore(cfg, DB_FILE)
         _store.on_insert = _on_record_inserted
+        # 记录落库后：给媒体登记引用并抓取尚未入库的媒体（见 ingest.py）
+        _store.on_persist = _on_record_persisted
+        # 消息被清理时，媒体库要同步摘掉引用（见 store.cleanup）
+        _store.media = _get_media()
         if not _hooks_ready:
             # 采集钩子只注册一次（Bot.on_calling_api 会累加回调，重复注册会记多条）
-            setup_capture(_store, cfg, _get_cache())
+            setup_capture(_store, cfg)
             register_hooks()
             _hooks_ready = True
     return _store
@@ -111,37 +135,25 @@ def _get_server() -> WebUIServer:
     return _server
 
 
-def _get_cache() -> FileCache:
-    """收到的图片/文件缓存（链接失效后仍能打开，见 filecache.py）。"""
-    global _cache
-    if _cache is None:
-        _cache = FileCache(
-            FILE_CACHE_DIR,
-            max_bytes=cfg.botui_cache_max_bytes if cfg.botui_cache_enabled else 0,
-            max_files=cfg.botui_cache_max_files if cfg.botui_cache_enabled else 0,
-            ttl=cfg.botui_cache_ttl,
-            retention=cfg.botui_cache_retention,
-            file_max_bytes=cfg.botui_cache_file_max_bytes,
-        )
-    return _cache
-
-
-def _get_uploads() -> UploadStore:
-    """上传附件的存储（WebUI 里选图/选文件后落盘用）。"""
-    global _uploads
-    if _uploads is None:
-        _uploads = UploadStore(
-            UPLOAD_DIR,
-            max_bytes=cfg.botui_upload_max_bytes,
-            ttl=cfg.botui_upload_ttl,
-        )
-    return _uploads
-
-
 def _on_record_inserted(record: MessageRecord) -> None:
     """记录落库后推送增量事件（WebUI 靠它实时刷新）"""
     if _store is not None and _server is not None:
         _server.publish_message(record, _store.chat(record.chat_key))
+
+
+async def _on_record_persisted(record: MessageRecord) -> None:
+    """记录落库并拿到行号后，把消息里的媒体收进媒体库（抓取是纯 IO，不挡写入）。
+
+    spawn 成后台任务是因为下载往往要花几秒；``ingest_message`` 内部会把段里的
+    url 回填成媒体库地址（内存副本），因此不影响已经推送给前端的记录。
+    """
+    media = _get_media()
+    if not media.enabled:
+        return
+    coro = ingest_message(media, record, cfg=cfg)
+    task = asyncio.get_running_loop().create_task(coro)
+    _bg_tasks.add(task)
+    task.add_done_callback(_bg_tasks.discard)
 
 
 def _bot_info(bot) -> dict[str, str]:
@@ -263,19 +275,17 @@ async def _cleanup_job() -> None:
         removed = await store.cleanup()
         if removed:
             logger.info(f'BotUI 已清理 {removed} 条超出上限的历史记录')
-    # 顺带回收过期上传附件：选完没发的（ttl）、以及发出后已过保留期的
+    # 回收媒体库：未被引用的按 ttl、被引用的按保留期——上传后没发出去的附件
+    # （ttl）与收到的、链接已失效的媒体都在这里一起回收。
+    if _media is None or not _media.ready:
+        return
     try:
-        dropped = await asyncio.to_thread(_get_uploads().cleanup)
+        dropped = await _media.cleanup()
     except Exception as e:  # pragma: no cover - 清理失败不影响机器人
-        logger.debug(f'BotUI 清理上传附件失败：{e}')
+        logger.debug(f'BotUI 清理媒体库失败：{e}')
         return
     if dropped:
-        logger.info(f'BotUI 已清理 {dropped} 个过期上传附件')
-    # 媒体缓存也在这里回收（未被引用的按 ttl，被引用的按保留期）
-    try:
-        await asyncio.to_thread(_get_cache().cleanup)
-    except Exception as e:  # pragma: no cover - 清理失败不影响机器人
-        logger.debug(f'BotUI 清理媒体缓存失败：{e}')
+        logger.info(f'BotUI 已清理 {dropped} 个过期媒体文件')
 
 
 def _log_banner(mounted: bool, store: MessageStore) -> None:
@@ -317,12 +327,19 @@ async def _on_startup() -> None:
     store = _get_store()
     await store.start()
     _token = _load_token()
+    media = _get_media()
+    # 媒体库跑在消息库的同一条连接上（见 mediastore.py）：连接刚建立、尚无任何
+    # 后台任务，正是建表（attach）的时机。
+    if media.enabled and store.db is not None:
+        await media.attach(store.db, store.lock)
     from . import api
 
     server = _get_server()
-    api.setup(store, server, _token, _get_uploads(), _get_cache())
+    api.setup(store, server, _token, media)
     mounted = _try_mount()
     await _seed_bots()
+    # 启动时先清一次：上次运行留下的过期媒体不必等到下一个周期
+    await _cleanup_job()
     if cfg.botui_allow_remote and not cfg.botui_auth:
         logger.warning(
             'BotUI 已允许非本机访问（BOTUI_ALLOW_REMOTE=true）且未开启令牌鉴权'
@@ -330,14 +347,18 @@ async def _on_startup() -> None:
             '冒充机器人发言，请务必确认！'
         )
     _log_banner(mounted, store)
+    # 清理周期：媒体库清理要「及时」（上传了没发的附件不该赖着），默认 10 分钟；
+    # 配成 0 时退回 6 小时一轮，只做消息记录的回收。
+    interval = int(cfg.botui_media_cleanup_interval)
+    trigger = {'minutes': interval} if interval > 0 else {'hours': 6}
     scheduler.add_job(
         _cleanup_job,
         'interval',
-        hours=6,
         id='botui_cleanup',
         replace_existing=True,
         max_instances=1,
         coalesce=True,
+        **trigger,
     )
 
 

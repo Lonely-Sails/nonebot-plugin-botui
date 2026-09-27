@@ -37,17 +37,17 @@ if _WORKER:
 os.environ['LOCALSTORE_PLUGIN_DATA_DIR'] = json.dumps(
     {'nonebot_plugin_botui': DATA_DIR}
 )
-# 本地缓存同样重定向，别把测试下载的字节写进开发机上真实的缓存目录。
-# 放在 DATA_DIR 之下：after_nonebot_init 会 rmtree(DATA_DIR)，顺带把上次跑剩的
-# 缓存清干净，不用再单独维护一份清理逻辑。
-CACHE_DIR = f'{DATA_DIR}/cache'
-os.environ['LOCALSTORE_PLUGIN_CACHE_DIR'] = json.dumps(
-    {'nonebot_plugin_botui': CACHE_DIR}
-)
 os.environ.setdefault('BOTUI_AUTH', 'true')
 os.environ.setdefault('BOTUI_TOKEN', 'test-token')
 os.environ.setdefault('BOTUI_SEND_INTERVAL', '0')
 os.environ.setdefault('BOTUI_RESOLVE_AT_NAME', 'false')
+# 媒体库：用一组「方便测试」的参数 —— ttl/retention 缩小到秒级（用例把时间戳
+# 拨回过去即可触发回收，不必真的等），配额收紧到 1MB（够用又不至于写得很多）。
+os.environ.setdefault('BOTUI_MEDIA_TTL', '100')
+os.environ.setdefault('BOTUI_MEDIA_RETENTION', '1000')
+os.environ.setdefault('BOTUI_MEDIA_MAX_BYTES', str(1024 * 1024))
+os.environ.setdefault('BOTUI_MEDIA_MAX_FILES', '1000')
+os.environ.setdefault('BOTUI_MEDIA_FILE_MAX_BYTES', str(1024 * 1024))
 # alconna 默认按 message_id 缓存解析结果（线上能省一次消息序列化），但测试里
 # 每个用例都是独立的世界，缓存会让上一个用例的消息串到下一个用例里。
 os.environ.setdefault('ALCONNA_CACHE_MESSAGE', 'false')
@@ -171,6 +171,25 @@ def botui(after_nonebot_init: None):
     if module is None:  # pragma: no cover - 正常加载时不会发生
         raise RuntimeError('BotUI 插件没有被加载，请检查 pyproject.toml 的 plugin_dirs')
     return module
+
+
+@pytest_asyncio.fixture(loop_scope='session')
+async def media(after_nonebot_init, botui):
+    """把媒体库挂到测试用的消息库连接上（与线上启动钩子做的事一致）。
+
+    媒体库是异步的、且必须 ``attach`` 到一条 aiosqlite 连接后才可用，所以这里
+    必须真的启动 store。**每个用例前后各清一次库**：媒体元数据都在同一张
+    ``blobs`` 表里，不同用例（包括自建的实例）共享它，不清就会互相串味。
+    """
+    store = botui._get_store()
+    await store.start()
+    m = botui._get_media()
+    if m.enabled and not m.ready and store.db is not None:
+        await m.attach(store.db, store.lock)
+    await m.clear('all')
+    m.reset_stats()
+    yield m
+    await m.clear('all')
 
 
 @pytest_asyncio.fixture(loop_scope='session', scope='session')

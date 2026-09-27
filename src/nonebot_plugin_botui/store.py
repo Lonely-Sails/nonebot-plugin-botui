@@ -214,11 +214,25 @@ class MessageStore:
         self._bots: dict[str, BotRecord] = {}
         # 每条记录落库后回调（用于推送给 WebUI 的增量事件流）
         self.on_insert: Any = None
+        # 每条记录落库后回调（用于给媒体登记引用，见 mediastore.py）
+        self.on_persist: Any = None
+        # 媒体库：消息被清理时顺带摘掉引用（由插件在启动后注入）
+        self.media: Any = None
 
     # ── 生命周期 ────────────────────────────────────────────────────────
     @property
     def path(self) -> Path:
         return self._path
+
+    @property
+    def db(self) -> aiosqlite.Connection | None:
+        """底层连接（媒体库与消息共用一个 SQLite 文件，见 mediastore.py）。"""
+        return self._db
+
+    @property
+    def lock(self) -> asyncio.Lock:
+        """写锁（媒体库写元数据时复用它，避免两套锁互相打架）。"""
+        return self._lock
 
     @property
     def ready(self) -> bool:
@@ -567,6 +581,14 @@ class MessageStore:
                 self.on_insert(rec)
             except Exception as e:  # pragma: no cover - 推送失败不影响存储
                 logger.debug(f'BotUI on_insert callback failed: {e}')
+
+        # 到这里行号已经有了：让媒体库据此登记引用（见 mediastore.py）。
+        # 放在落库之后是**关键** —— 引用标记里带行号，早于插入是拿不到的。
+        if self.on_persist is not None:
+            try:
+                await self.on_persist(rec)
+            except Exception as e:  # pragma: no cover - 记引用失败不影响存储
+                logger.debug(f'BotUI on_persist callback failed: {e}')
 
     async def flush(self) -> None:
         """等待队列中的写入完成（测试与关闭时使用）"""
@@ -1007,28 +1029,35 @@ class MessageStore:
 
     # ── 维护 ────────────────────────────────────────────────────────────
     async def cleanup(self) -> int:
-        """按条数/天数上限清理旧记录，返回删除条数"""
+        """按条数/天数上限清理旧记录，返回删除条数。
+
+        删掉的记录同时要把它们给媒体留下的引用摘掉（见 ``mediastore.py``）：
+        否则媒体会被永久当成「还有人用」而占着配额。摘引用要与删除在**同一处**
+        发生，不然迟早漏掉一条路径。
+        """
         if self._db is None:
             return 0
         removed = 0
+        dropped: list[tuple[str, str]] = []  # (chat_key, 行号)
         try:
             async with self._lock:
                 if self._cfg.botui_max_records > 0:
                     count = await self.count()
                     extra = count - self._cfg.botui_max_records
                     if extra > 0:
-                        await self._db.execute(
-                            'DELETE FROM messages WHERE id IN '
-                            '(SELECT id FROM messages ORDER BY id ASC LIMIT ?)',
+                        expired = await self._delete_messages(
+                            'SELECT id, chat_key FROM messages ORDER BY id ASC LIMIT ?',
                             (extra,),
                         )
-                        removed += extra
+                        dropped += expired
+                        removed += len(expired)
                 if self._cfg.botui_retention_days > 0:
                     cutoff = time.time() - self._cfg.botui_retention_days * 86400
-                    cur = await self._db.execute(
-                        'DELETE FROM messages WHERE ts < ?', (cutoff,)
+                    expired = await self._delete_messages(
+                        'SELECT id, chat_key FROM messages WHERE ts < ?', (cutoff,)
                     )
-                    removed += cur.rowcount or 0
+                    dropped += expired
+                    removed += len(expired)
                     # 名册跟着保留期一起清：否则长期跑下来 members 会无限增长
                     await self._db.execute(
                         'DELETE FROM members WHERE last_at < ?', (cutoff,)
@@ -1037,7 +1066,39 @@ class MessageStore:
                     await self._db.commit()
         except Exception as e:
             logger.warning(f'Failed to clean up old messages: {e}')
+        await self._drop_media_refs(dropped)
         return removed
+
+    async def _delete_messages(
+        self, select_sql: str, params: tuple[Any, ...]
+    ) -> list[tuple[str, str]]:
+        """先查出待删行，再按行号删除；返回 ``(chat_key, 行号)`` 列表。
+
+        先查后删（而不是直接 ``DELETE``）是为了拿到行号 —— 媒体的引用标记里
+        记的就是行号，删完就再也对不上账了。
+        """
+        assert self._db is not None
+        async with self._db.execute(select_sql, params) as cur:
+            rows = list(await cur.fetchall())
+        if not rows:
+            return []
+        ids = [int(row['id']) for row in rows]
+        marks = ','.join('?' * len(ids))
+        await self._db.execute(f'DELETE FROM messages WHERE id IN ({marks})', ids)
+        return [(str(row['chat_key']), str(row['id'])) for row in rows]
+
+    async def _drop_media_refs(self, pairs: list[tuple[str, str]]) -> None:
+        """把上面删掉的那些行在媒体库里留下的引用摘掉。"""
+        if not pairs or self.media is None:
+            return
+        grouped: dict[str, list[int]] = {}
+        for key, row_id in pairs:
+            grouped.setdefault(key, []).append(int(row_id))
+        try:
+            for key, ids in grouped.items():
+                await self.media.drop_message_refs(key, ids)
+        except Exception as e:  # pragma: no cover - 摘引用失败不影响清理
+            logger.debug(f'BotUI 摘除媒体引用失败：{e}')
 
     async def vacuum(self) -> None:
         if self._db is None:
@@ -1068,6 +1129,12 @@ class MessageStore:
             await self._db.commit()
         self._chats.clear()
         self._members.clear()
+        # 消息没了，它们给媒体留下的引用也一并作废（否则媒体永远不回收）
+        if self.media is not None:
+            try:
+                await self.media.clear('orphans')
+            except Exception as e:  # pragma: no cover - 清理失败不影响重置
+                logger.debug(f'BotUI 重置时清理媒体失败：{e}')
         logger.info('BotUI 已清空全部聊天记录')
 
     async def get_meta(self, key: str, default: str = '') -> str:

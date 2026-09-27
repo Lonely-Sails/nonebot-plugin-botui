@@ -31,13 +31,12 @@ from .models import (
 )
 from .capture import resume_sent, suppress_sent, build_outgoing
 from .segments import guess_mime, resolve_file_name
-from .filecache import ID_PATTERN, FileCache
+from .mediastore import ID_PATTERN, MediaStore, url_of
 
 if TYPE_CHECKING:
     from .store import MessageStore
     from .webui import WebUIServer
-    from .uploads import UploadStore, UploadRecord
-    from .filecache import CachedFile
+    from .mediastore import MediaRecord
 
 VERSION = '0.1.0'
 
@@ -48,15 +47,14 @@ WS_HEARTBEAT = 25.0
 #: 一次发送最多带几个附件（多了适配器多半也发不出去，还会把请求撑得很大）
 MAX_UPLOADS_PER_MESSAGE = 10
 
-#: 清理缓存时允许的模式（前端设置面板的按钮各对应一个）
-CACHE_CLEAR_MODES = frozenset({'all', 'orphans', 'image', 'file'})
+#: 清理媒体库时允许的模式（前端设置面板的按钮各对应一个）
+MEDIA_CLEAR_MODES = frozenset({'all', 'orphans', 'image', 'file'})
 
 router = APIRouter()
 
 _store: 'MessageStore | None' = None
 _server: 'WebUIServer | None' = None
-_uploads: 'UploadStore | None' = None
-_cache: FileCache | None = None
+_media: MediaStore | None = None
 _token: str = ''
 _last_send: dict[str, float] = {}
 _static_dir = Path(__file__).parent / 'static'
@@ -66,45 +64,32 @@ def setup(
     store: 'MessageStore',
     server: 'WebUIServer',
     token: str,
-    uploads: 'UploadStore | None' = None,
-    cache: FileCache | None = None,
+    media: MediaStore | None = None,
 ) -> None:
     """注入依赖（由插件在启动时调用一次）。
 
     存储、事件服务、令牌都由这里一次性注入，而不是一半用模块变量、一半塞进
     ``app.state`` —— 两套机制混用会让「谁先谁后」变得难以推断。
 
-    ``uploads`` 是 WebUI 上传附件的存储（见 ``uploads.py``）；``cache`` 是
-    收到的媒体/文件缓存（见 ``filecache.py``）。两者不传时按配置各建一个
-    默认实例，方便测试直接调用本模块。
+    ``media`` 是媒体库（见 ``mediastore.py``）：机器人收发的图片/文件、WebUI
+    上传的附件都放在一起。不传时按配置建一个默认实例，方便测试直接调用本模块。
     """
-    global _store, _server, _token, _uploads, _cache
+    global _store, _server, _token, _media
     _store = store
     _server = server
     _token = token
-    if uploads is not None:
-        _uploads = uploads
-    elif _uploads is None:
-        from .paths import UPLOAD_DIR
-        from .uploads import UploadStore
+    if media is not None:
+        _media = media
+    elif _media is None:
+        from .paths import BLOB_DIR
 
-        _uploads = UploadStore(
-            UPLOAD_DIR,
-            max_bytes=cfg.botui_upload_max_bytes,
-            ttl=cfg.botui_upload_ttl,
-        )
-    if cache is not None:
-        _cache = cache
-    elif _cache is None:
-        from .paths import FILE_CACHE_DIR
-
-        _cache = FileCache(
-            FILE_CACHE_DIR,
-            max_bytes=cfg.botui_cache_max_bytes if cfg.botui_cache_enabled else 0,
-            max_files=cfg.botui_cache_max_files if cfg.botui_cache_enabled else 0,
-            ttl=cfg.botui_cache_ttl,
-            retention=cfg.botui_cache_retention,
-            file_max_bytes=cfg.botui_cache_file_max_bytes,
+        _media = MediaStore(
+            BLOB_DIR,
+            max_bytes=cfg.botui_media_max_bytes if cfg.botui_media_enabled else 0,
+            max_files=cfg.botui_media_max_files if cfg.botui_media_enabled else 0,
+            ttl=cfg.botui_media_ttl,
+            retention=cfg.botui_media_retention,
+            file_max_bytes=cfg.botui_media_file_max_bytes,
         )
 
 
@@ -310,13 +295,15 @@ async def get_meta(request: Request) -> dict[str, Any]:
             'preview': bool(cfg.botui_file_preview),
             'export': True,
             'forward': True,
-            'upload': bool(cfg.botui_upload_enabled and cfg.botui_write_enabled),
+            'upload': bool(cfg.botui_media_enabled and cfg.botui_write_enabled),
         },
         'file_preview': bool(cfg.botui_file_preview),
         'file_max_bytes': int(cfg.botui_file_max_bytes),
-        'upload_enabled': bool(cfg.botui_upload_enabled and cfg.botui_write_enabled),
-        'upload_max_bytes': int(cfg.botui_upload_max_bytes),
-        'cache_enabled': bool(_cache is not None and _cache.enabled),
+        'upload_enabled': bool(cfg.botui_media_enabled and cfg.botui_write_enabled),
+        'upload_max_bytes': int(
+            cfg.botui_media_file_max_bytes or cfg.botui_file_max_bytes
+        ),
+        'cache_enabled': bool(_media is not None and _media.enabled),
     }
     # 这些是环境细节：数据库在磁盘上的位置、机器人的 self_id 清单、消息总量。
     # 未通过校验时不返回，避免匿名请求就能摸清部署情况。
@@ -552,7 +539,7 @@ async def _throttle(key: str) -> None:
     _last_send[key] = time.time()
 
 
-# ── 上传附件（WebUI 里选图/选文件后以机器人身份发出）────────────────────
+# ── 附件上传（WebUI 里选图/选文件后以机器人身份发出）────────────────────
 async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
     """从上传请求里取出 ``(字节, 文件名, 类型)``。
 
@@ -569,22 +556,26 @@ async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
 
 @router.post('/api/upload')
 async def post_upload(request: Request) -> dict[str, Any]:
-    """把附件（图片 / 文件）存到服务端，返回一个可在 ``/api/send`` 里引用的 id。
+    """把附件（图片 / 文件）存进媒体库，返回一个可在 ``/api/send`` 里引用的 id。
 
-    前端「选附件」这一步就调这里：附件先落盘，之后带上 ``uploads: [id]`` 发送。
+    前端「选附件」这一步就调这里：附件先入库，之后带上 ``uploads: [id]`` 发送。
     这么拆是因为发送前往往要展示预览（图片缩略图、文件名），而发送时才需要
     真实文件；一次性把文件塞进发送请求会让「预览」变得没有意义。
+
+    存进媒体库（而不是单独的临时目录）是刻意的：上传的附件与机器人收到的媒体
+    从此是同一种东西 —— 一个目录、一张表、一个取回地址，发送时也就不必再把它
+    从一处「搬」到另一处。选完没发的附件由 ttl 回收（见 ``mediastore.py``）。
     """
     _guard_write(request)
-    if not cfg.botui_upload_enabled:
+    if not cfg.botui_media_enabled:
         raise HTTPException(status_code=403, detail='BotUI 未开启附件上传')
-    if _uploads is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
 
     data, name, mime = await _read_uploaded(request)
     if not data:
         raise HTTPException(status_code=400, detail='没有收到文件内容')
-    limit = int(cfg.botui_upload_max_bytes)
+    limit = int(cfg.botui_media_file_max_bytes)
     if limit > 0 and len(data) > limit:
         raise HTTPException(
             status_code=413,
@@ -592,60 +583,51 @@ async def post_upload(request: Request) -> dict[str, Any]:
                 f'文件过大（{len(data) / 1048576:.1f} MB，上限 {limit // 1048576} MB）'
             ),
         )
-    try:
-        record = await asyncio.to_thread(_uploads.save, data, name, mime)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e)) from e
-    except Exception as e:  # pragma: no cover - 磁盘异常
-        logger.opt(exception=True).warning(f'BotUI failed to save upload: {e}')
-        raise HTTPException(status_code=500, detail=f'保存附件失败：{e}') from e
+    record = await _media.save(data, name=name, mime=mime)
+    if record is None:
+        raise HTTPException(status_code=413, detail='附件过大或媒体库未启用')
     return {'ok': True, 'file': record.to_dict()}
 
 
-@router.get('/api/upload')
-async def get_upload(
+@router.get('/api/media/{fid}')
+async def get_media(
     request: Request,
-    id: str = Query(..., min_length=6, max_length=64),
+    fid: str,
     download: int = Query(0, ge=0, le=1),
 ) -> Any:
-    """取回 WebUI 上传的附件（图片缩略图 / 下载）。
+    """按 id 取回媒体库里的资源（消息段里的地址就指向这里）。
 
-    消息段里的 url 就指向这里，所以渲染聊天记录时本地图片也能正常显示 ——
-    不必依赖任何外部图床。仅本机 + 令牌可访问（``_guard``）。
+    机器人收到的图片/文件、自己发出的附件都从这里取，因此前端只需要认识一个
+    地址形态。这个接口不需要 ``store``：媒体库本身就是完整副本，即使对应消息
+    早被上限清理掉了，只要资源还在就能打开。
     """
     _guard(request)
-    if _uploads is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
-    record = _uploads.get(id)
-    if record is None or not record.path.is_file():
-        raise HTTPException(status_code=404, detail='附件不存在或已过期')
-    disposition = 'attachment' if download else 'inline'
-    return FileResponse(
-        record.path,
-        media_type=record.mime or 'application/octet-stream',
-        filename=record.name,
-        content_disposition_type=disposition,
-        headers={'Cache-Control': 'private, max-age=600'},
-    )
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
+    if not fid or not re.fullmatch(ID_PATTERN, fid):
+        raise HTTPException(status_code=404, detail='媒体不存在')
+    record = await _media.get(fid)
+    if record is None:
+        raise HTTPException(status_code=404, detail='媒体不存在或已被清理')
+    return _media_response(record, download=bool(download))
 
 
-@router.delete('/api/upload')
-async def delete_upload(
-    request: Request,
-    id: str = Query(..., min_length=6, max_length=64),
-) -> dict[str, Any]:
-    """删除一个还没发出的附件（前端移除待发送项时调用）。"""
+@router.delete('/api/media/{fid}')
+async def delete_media(request: Request, fid: str) -> dict[str, Any]:
+    """删除媒体库里的一条资源（前端移除待发送附件时调用）。"""
     _guard_write(request)
-    if _uploads is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
-    removed = await asyncio.to_thread(_uploads.delete, id)
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
+    if not fid or not re.fullmatch(ID_PATTERN, fid):
+        raise HTTPException(status_code=404, detail='媒体不存在')
+    removed = await _media.delete(fid)
     return {'ok': True, 'removed': removed}
 
 
 async def _upload_segment(
-    record: 'UploadRecord',
+    record: 'MediaRecord',
 ) -> tuple[Any, dict[str, Any]]:
-    """把一条上传附件转成 ``(uniseg 段, 记录里的段字典)``。
+    """把一条媒体资源转成 ``(uniseg 段, 记录里的段字典)``。
 
     图片按 ``Image`` 发（聊天里直接显示），其余按 ``File`` 发；两者都用文件
     内容/路径而不是 URL：适配器把 ``Image(path=...)`` 转成 ``file://`` 只有
@@ -654,13 +636,15 @@ async def _upload_segment(
 
     ``File`` 段的 exporter 只认 ``path``（不认 ``raw``），所以文件走路径。
 
-    段里的 url 指向 ``/api/upload?id=...``：前端带令牌就能取回，因此**发出的
-    消息在记录里依然能显示图片**（附件被清理后才退化成占位）。
+    段里的 url 指向媒体库地址：前端带令牌就能取回，因此**发出的消息在记录里
+    依然能显示图片**。附件上传时就已经在媒体库里定了 id（:meth:`MediaStore.save`
+    返回的地址就是它），所以不存在「返回的地址」与「库里的地址」不一致的情况。
     """
     from nonebot_plugin_alconna.uniseg import File, Image
 
-    url = f'{cfg.botui_route}/api/upload?id={record.id}'
-    if record.kind == 'image':
+    url = url_of(record.id)
+    kind = record.kind
+    if kind == 'image':
         data = await asyncio.to_thread(record.path.read_bytes)
         seg: Any = Image(raw=data, name=record.name, mimetype=record.mime or None)
         payload: dict[str, Any] = {
@@ -681,12 +665,12 @@ async def _upload_segment(
     return seg, payload
 
 
-async def _resolve_upload(raw: Any) -> 'UploadRecord':
-    """按 id 取回附件，取不到时抛 404。"""
+async def _resolve_upload(raw: Any) -> 'MediaRecord':
+    """按 id 取回媒体资源，取不到时抛 404。"""
     uid = str(raw or '').strip()
-    if _uploads is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 附件存储尚未就绪')
-    record = await asyncio.to_thread(_uploads.get, uid)
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
+    record = await _media.get(uid)
     if record is None:
         raise HTTPException(status_code=404, detail=f'附件 {uid or "?"} 不存在或已过期')
     return record
@@ -754,20 +738,18 @@ async def post_send(request: Request) -> dict[str, Any]:
         raise HTTPException(
             status_code=400, detail=f'一次最多发送 {MAX_UPLOADS_PER_MESSAGE} 个附件'
         )
-    if upload_ids and not cfg.botui_upload_enabled:
+    if upload_ids and not cfg.botui_media_enabled:
         raise HTTPException(status_code=403, detail='BotUI 未开启附件上传')
 
     # 附件要在发送前取好：一是确认它们都还在（过期会 404），二是把 uniseg 段
     # 提前构造出来。发送时附件排在正文之后。
     extra: list[Any] = []
     upload_segments: list[dict[str, Any]] = []
-    upload_records: list['UploadRecord'] = []
     for uid in upload_ids:
         item = await _resolve_upload(uid)
         seg, seg_dict = await _upload_segment(item)
         extra.append(seg)
         upload_segments.append(seg_dict)
-        upload_records.append(item)
 
     chat = store.chat(key)
     if chat is None:
@@ -795,11 +777,8 @@ async def post_send(request: Request) -> dict[str, Any]:
         logger.opt(exception=True).warning(f'BotUI failed to send message: {e}')
         raise HTTPException(status_code=502, detail=f'发送失败：{e}') from e
 
-    # 附件已经发出去了：延长它们的保留时间，别让聊天记录里的图片一小时后就坏掉
-    for item in upload_records:
-        await asyncio.to_thread(_mark_upload_used, item.id)
-
-    # 主动补一条记录：即使采集钩子因故没生效，WebUI 里也能看到
+    # 主动补一条记录：即使采集钩子因故没生效，WebUI 里也能看到。
+    # 段里用的就是媒体库地址，与库里、与推送出去的完全一致（不再有竞态回填）。
     record = build_outgoing(
         chat,
         await _payload_segments(
@@ -816,16 +795,9 @@ async def post_send(request: Request) -> dict[str, Any]:
     )
     record.message_id = _message_id_of(receipt)
     store.enqueue(record)
-    # 等待落库：既保证下面的返回值带有真实行号，也让增量事件先推出去
+    # 落库后行号才可用；store.on_persist 会给附件补上指向这条记录的引用
     await store.flush()
     return {'ok': True, 'message': record.to_dict()}
-
-
-def _mark_upload_used(uid: str) -> None:
-    """把附件标记为已发出（拿不到上传存储时静默跳过）。"""
-    if _uploads is None:  # pragma: no cover - setup 一定会注入
-        return
-    _uploads.mark_used(uid)
 
 
 async def _quoted_segment(store: 'MessageStore', message_id: str) -> dict[str, Any]:
@@ -963,7 +935,7 @@ async def get_static(filename: str) -> FileResponse:
 
 # ── 媒体代理 ────────────────────────────────────────────────────────────
 @router.get('/media')
-async def get_media(request: Request, u: str = Query(..., min_length=8)) -> Any:
+async def proxy_media(request: Request, u: str = Query(..., min_length=8)) -> Any:
     """代理远程图片：QQ 的图片链接大多带防盗链，直接 <img src> 会加载失败。
 
     这个接口是「按用户给的 URL 去取内容」，所以必须和别的数据接口一样过
@@ -978,10 +950,10 @@ async def get_media(request: Request, u: str = Query(..., min_length=8)) -> Any:
     parts = urlsplit(u)
     if parts.scheme not in ('http', 'https'):
         raise HTTPException(status_code=400, detail='仅支持 http/https 链接')
-    # 本地缓存优先：图片是最先失效的一类资源，命中就不再联网
-    cached = await _local_cached(u)
+    # 本地媒体库优先：图片是最先失效的一类资源，命中就不再联网
+    cached = await _local_media(u)
     if cached is not None:
-        return _cached_response(cached)
+        return _media_response(cached)
     result = await fetch(u)
     if result is None:
         # 拿不到就退回原链接，前端仍然显示为破图而不是报错
@@ -1017,40 +989,40 @@ async def _resolve_media_url(store: 'MessageStore | None', raw: str) -> str:
     return ''
 
 
-async def _local_cached(u: str) -> 'CachedFile | None':
-    """如果这个地址已经有本地缓存副本，返回对应的 :class:`CachedFile`。
+async def _local_media(u: str) -> 'MediaRecord | None':
+    """如果这个地址在媒体库里已有副本，返回对应的 :class:`MediaRecord`。
 
-    有了它，媒体/文件就再也不用去碰那个随时会失效的原始链接 —— 这正是
-    「缓存」的收益所在。地址既可能是原始链接，也可能是缓存地址本身。
+    有了它，媒体/文件就再也不用去碰那个随时会失效的原始链接 —— 这正是媒体库
+    的收益所在。地址既可能是原始链接，也可能是媒体库地址本身（``/api/media``）。
     """
-    if _cache is None:
+    if _media is None:
         return None
     text = str(u or '').strip()
     if not text:
         return None
-    return await asyncio.to_thread(_cache.lookup, text)
+    return await _media.lookup(text)
 
 
-def _cached_response(
-    cached: 'CachedFile', *, download: bool = False, name: str = ''
+def _media_response(
+    record: 'MediaRecord', *, download: bool = False, name: str = ''
 ) -> Any:
-    """本地缓存副本的响应（与 ``/api/file`` 的对外行为保持一致）。
+    """媒体库副本的响应（与 ``/api/file`` 的对外行为保持一致）。
 
     统一交给 ``FileResponse``：它自带 Range 支持（音视频拖进度条靠它），
     自己拼 ``StreamingResponse`` 反而要重写一遍 Range 解析。
     """
-    filename = resolve_file_name(name or cached.name, cached.source, fallback='file')
+    filename = resolve_file_name(name or record.name, record.source, fallback='file')
     media = (
-        cached.mime
-        or guess_mime(cached.source or filename)
+        record.mime
+        or guess_mime(record.source or filename)
         or 'application/octet-stream'
     )
     return FileResponse(
-        cached.path,
+        record.path,
         media_type=media,
         headers={
             'Cache-Control': 'private, max-age=600',
-            # 响应头不能把「命中了缓存」变成浏览器的缓存键，所以只做一个诊断标记
+            # 响应头不能把「命中了媒体库」变成浏览器的缓存键，所以只做一个诊断标记
             'X-BotUI-Cache': 'hit' if not download else 'hit-download',
             'Content-Disposition': _content_disposition(
                 'attachment' if download else 'inline', filename
@@ -1059,16 +1031,16 @@ def _cached_response(
     )
 
 
-async def _preview_local(cached: 'CachedFile', name: str) -> dict[str, Any]:
-    """用本地缓存副本做文本预览（不联网，因而不受链接失效影响）。"""
+async def _preview_media(record: 'MediaRecord', name: str) -> dict[str, Any]:
+    """用媒体库副本做文本预览（不联网，因而不受链接失效影响）。"""
     from .media import MAX_TEXT_BYTES, is_textual, decode_text
 
-    filename = resolve_file_name(name or cached.name, cached.source)
-    if not is_textual(cached.mime, filename):
+    filename = resolve_file_name(name or record.name, record.source)
+    if not is_textual(record.mime, filename):
         raise HTTPException(status_code=415, detail='该文件不是文本类型，无法在线预览')
 
     def _read() -> bytes:
-        with cached.path.open('rb') as handle:
+        with record.path.open('rb') as handle:
             return handle.read(MAX_TEXT_BYTES)
 
     data = await asyncio.to_thread(_read)
@@ -1080,9 +1052,9 @@ async def _preview_local(cached: 'CachedFile', name: str) -> dict[str, Any]:
         'name': filename,
         'text': text,
         'truncated': truncated,
-        'content_type': cached.mime or None,
-        'bytes': cached.size,
-        'url': cached.source,
+        'content_type': record.mime or None,
+        'bytes': record.size,
+        'url': record.source,
         'cached': True,
     }
 
@@ -1124,25 +1096,25 @@ _PASSTHROUGH_HEADERS = (
 )
 
 
-# ── 本地缓存：取回与管理 ────────────────────────────────────────────────
+# ── 媒体库：取回与管理 ──────────────────────────────────────────────────
 @router.get('/api/cache')
 async def get_cache(request: Request) -> dict[str, Any]:
-    """缓存概况（设置面板显示占用与命中数）。"""
+    """媒体库概况（设置面板显示占用与命中数）。"""
     _guard(request)
-    if _cache is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
-    return {'ok': True, 'cache': await asyncio.to_thread(_cache.stats)}
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
+    return {'ok': True, 'cache': await _media.stats()}
 
 
 @router.post('/api/cache')
 async def post_cache(request: Request) -> dict[str, Any]:
-    """缓存维护：清理（按模式）与重置统计。
+    """媒体库维护：清理（按模式）与重置统计。
 
     清理是真的删文件，所以走 ``_guard_write`` —— 只读模式下不该动磁盘。
     """
     _guard_write(request)
-    if _cache is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
+    if _media is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
     try:
         payload = await request.json()
     except Exception:
@@ -1151,44 +1123,22 @@ async def post_cache(request: Request) -> dict[str, Any]:
 
     action = str(body.get('action') or 'clear')
     if action == 'reset_stats':
-        await asyncio.to_thread(_cache.reset_stats)
-        return {'ok': True, 'cache': await asyncio.to_thread(_cache.stats)}
+        _media.reset_stats()
+        return {'ok': True, 'cache': await _media.stats()}
     if action != 'clear':
         raise HTTPException(status_code=400, detail=f'不支持的操作：{action}')
 
     mode = str(body.get('mode') or 'all')
-    if mode not in CACHE_CLEAR_MODES:
+    if mode not in MEDIA_CLEAR_MODES:
         raise HTTPException(status_code=400, detail=f'不支持的清理方式：{mode}')
-    result = await asyncio.to_thread(_cache.clear, mode)
+    result = await _media.clear(mode)
     return {
         'ok': True,
         'mode': mode,
         'removed': int(result.get('removed') or 0),
         'bytes': int(result.get('bytes') or 0),
-        'cache': await asyncio.to_thread(_cache.stats),
+        'cache': await _media.stats(),
     }
-
-
-@router.get('/api/cache/{fid}')
-async def get_cached(
-    request: Request,
-    fid: str,
-    download: int = Query(0, ge=0, le=1),
-) -> Any:
-    """按 id 取回本地缓存的媒体/文件（消息段里的地址就指向这里）。
-
-    这个接口不需要 ``store``：缓存本身就是完整副本，即使对应消息早被上限
-    清理掉了，只要资源还在就能打开。
-    """
-    _guard(request)
-    if _cache is None:  # pragma: no cover - setup 一定会注入
-        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
-    if not fid or not re.fullmatch(ID_PATTERN, fid):
-        raise HTTPException(status_code=404, detail='缓存不存在')
-    record = await asyncio.to_thread(_cache.get, fid)
-    if record is None:
-        raise HTTPException(status_code=404, detail='缓存不存在或已被清理')
-    return _cached_response(record, download=bool(download))
 
 
 @router.get('/api/file')
@@ -1215,10 +1165,10 @@ async def get_file(
     _guard(request)
     store = _require_store()
 
-    # 有本地缓存副本就直接回本地文件：既能规避防盗链，也不再受链接过期影响
-    cached = await _local_cached(u)
+    # 有本地媒体库副本就直接回本地文件：既能规避防盗链，也不再受链接过期影响
+    cached = await _local_media(u)
     if cached is not None:
-        return _cached_response(cached, download=bool(download), name=name)
+        return _media_response(cached, download=bool(download), name=name)
 
     url = await _resolve_media_url(store, u)
     if not url:
@@ -1299,9 +1249,9 @@ async def get_preview(
     store = _require_store()
 
     # 本地缓存优先：读到本地副本就干脆不必联网
-    cached = await _local_cached(u)
+    cached = await _local_media(u)
     if cached is not None:
-        return await _preview_local(cached, name)
+        return await _preview_media(cached, name)
 
     url = await _resolve_media_url(store, u)
     if not url:

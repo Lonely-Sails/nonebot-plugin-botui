@@ -12,9 +12,6 @@ MAX_RAW = 2000
 # 单条合并转发最多展开的节点数（防止恶意超长转发把响应撑爆）
 MAX_FORWARD_NODES = 200
 
-#: 值得缓存到本地的段类型（见 cacheable_segments）
-CACHEABLE_TYPES = frozenset({'image', 'file', 'voice', 'audio', 'video'})
-
 # 常见的卡片类原始段类型
 _HYPER_TYPES = {'json', 'xml'}
 
@@ -861,26 +858,41 @@ def at_targets(segments: list[dict[str, Any]]) -> list[str]:
     return out
 
 
+def _is_plugin_url(url: str) -> bool:
+    """是不是本插件自己的媒体地址（见 ``mediastore.is_plugin_url``）。
+
+    这类地址本来就指向服务端已有的本地副本，采集时不需要重新下载；但**要交给
+    媒体库登记引用**，否则自己发出的图片会因为「没被引用」而被按 ttl 早早回收。
+    """
+    from .mediastore import is_plugin_url
+
+    return is_plugin_url(url)
+
+
 def cacheable_segments(
     segments: list[dict[str, Any]], limit: int = 0
 ) -> list[dict[str, Any]]:
-    """挑出值得缓存到本地的段（图片 / 文件 / 语音 / 音频 / 视频）。
+    """挑出值得存进媒体库的段（图片 / 文件 / 语音 / 音频 / 视频）。
 
-    只认 **http(s) 直链**：``base64://`` / ``file://`` 这类本地已有的内容不必
-    再复制一份，而 ``file://`` 只在机器人本机有效、对 WebUI 也没意义。
+    只认 **http(s) 直链**与**本插件自己的媒体地址**：``base64://`` /
+    ``file://`` 这类本地已有的内容不必再复制一份，而 ``file://`` 只在机器人
+    本机有效、对 WebUI 也没意义。插件地址虽然不必下载，但要交给媒体库登记
+    引用（见 ``ingest.py``），所以一并选出来。
 
     ``limit > 0`` 时按顺序最多返回 ``limit`` 个 —— 媒体直链普遍只有几分钟的
     有效期，收到消息的那一刻就该把它们抓下来，但一条消息里塞几十个文件时
     也不该让采集任务跑上几分钟。
     """
+    from .mediastore import MEDIA_TYPES
+
     out: list[dict[str, Any]] = []
     for seg in segments:
         if not isinstance(seg, dict):
             continue
-        if seg.get('type') not in CACHEABLE_TYPES:
+        if seg.get('type') not in MEDIA_TYPES:
             continue
         url = str(seg.get('url') or '').strip()
-        if not url.startswith(('http://', 'https://')):
+        if not url.startswith(('http://', 'https://')) and not _is_plugin_url(url):
             continue
         out.append(seg)
         if limit > 0 and len(out) >= limit:

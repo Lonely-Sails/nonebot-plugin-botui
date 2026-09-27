@@ -37,11 +37,9 @@ from .segments import to_segments, extract_text, to_segments_async
 
 if TYPE_CHECKING:
     from .store import MessageStore
-    from .filecache import FileCache
 
 _store: MessageStore | None = None
 _cfg: Config | None = None
-_cache: 'FileCache | None' = None
 
 # 待关联结果的发送调用：id(payload) -> 记录
 _pending_sends: dict[int, MessageRecord] = {}
@@ -80,22 +78,15 @@ def _spawn(coro) -> None:
     task.add_done_callback(_bg_tasks.discard)
 
 
-def setup(
-    store: 'MessageStore', config: Config, cache: 'FileCache | None' = None
-) -> None:
-    """注册采集钩子"""
-    global _store, _cfg, _cache
+def setup(store: 'MessageStore', config: Config) -> None:
+    """注册采集钩子（媒体入库由 ``store.on_persist`` 驱动，见 ``__init__.py``）"""
+    global _store, _cfg
     _store = store
     _cfg = config
-    _cache = cache
 
 
 def store_ref() -> 'MessageStore | None':
     return _store
-
-
-def cache_ref() -> 'FileCache | None':
-    return _cache
 
 
 def suppress_sent() -> Token[bool]:
@@ -128,39 +119,22 @@ def _enabled_for(adapter: str) -> bool:
 
 
 def _persist(record: MessageRecord) -> None:
-    """入队并周期性做清理"""
+    """入队并周期性做清理。
+
+    媒体入库不在这里做：记录落库拿到行号后，``store.on_persist`` 会回调
+    （见 ``__init__._on_record_persisted``），那边才 spawn 下载任务。这样
+    「谁负责登记引用」只有一处，不会这里也记、那里也记。
+    """
     global _prune_counter
     if _store is None:
         return
     _store.enqueue(record)
-    # 落库后立刻把媒体缓存下来：这些直链普遍只有几分钟有效期，等清理任务
-    # 顺路处理就已经失效了（这也是「缓冲一下避免 url 失效」的核心时机）。
-    # 缓存失败/没开缓存都不影响记录本身，所以放后台跑，不 await。
-    if _cache is not None and _cfg is not None and _cache.enabled:
-        _spawn(_cache_media_of(record))
     _prune_counter += 1
     if _prune_counter >= _PRUNE_EVERY:
         _prune_counter = 0
         _cfg_now = _cfg
         if _cfg_now and (_cfg_now.botui_max_records or _cfg_now.botui_retention_days):
             _spawn(_store.cleanup())
-
-
-async def _cache_media_of(record: MessageRecord) -> None:
-    """等记录落库拿到行号，再把它里面的媒体下载到本地缓存。"""
-    assert _store is not None
-    assert _cfg is not None
-    try:
-        await _store.flush()
-    except Exception as e:  # pragma: no cover - 落库异常时跳过缓存
-        logger.debug(f'BotUI 落库前无法缓存媒体：{e}')
-        return
-    from .filefetch import cache_message
-
-    try:
-        await cache_message(_cache, record, cfg=_cfg)
-    except Exception as e:  # pragma: no cover - 缓存失败不影响机器人
-        logger.debug(f'BotUI 缓存媒体失败：{e}')
 
 
 # ── 收到的消息 ──────────────────────────────────────────────────────────
@@ -588,7 +562,6 @@ def build_outgoing(
 __all__ = [
     'avatar_of',
     'build_outgoing',
-    'cache_ref',
     'describe_segments',
     'register_hooks',
     'resolve_at_name',
