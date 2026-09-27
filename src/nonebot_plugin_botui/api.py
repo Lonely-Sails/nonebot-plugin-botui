@@ -8,6 +8,7 @@ import secrets
 import ipaddress
 from typing import TYPE_CHECKING, Any
 from pathlib import Path
+from dataclasses import replace
 from urllib.parse import urlsplit
 
 import nonebot
@@ -18,7 +19,14 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from starlette.requests import HTTPConnection
 
 from .config import plugin_config as cfg
-from .models import DIR_OUT, KIND_GROUP, ChatRecord, split_chat_key, describe_segments
+from .models import (
+    DIR_OUT,
+    KIND_GROUP,
+    ChatRecord,
+    self_id_of,
+    split_chat_key,
+    describe_segments,
+)
 from .capture import resume_sent, suppress_sent, build_outgoing
 
 if TYPE_CHECKING:
@@ -135,20 +143,43 @@ def _bots() -> list[Bot]:
     return list(nonebot.get_bots().values())
 
 
-def _pick_bot(chat: ChatRecord | None, bots: list[Bot] | None = None) -> Bot | None:
-    items = bots if bots is not None else _bots()
-    if not items:
+def _live_bot(self_id: str) -> Bot | None:
+    """按 ID 取当前在线的机器人，没有就返回 None"""
+    self_id = str(self_id or '')
+    if not self_id:
         return None
-    if chat is not None:
-        if chat.self_id:
-            for bot in items:
-                if str(bot.self_id) == str(chat.self_id):
-                    return bot
-        if chat.adapter:
-            for bot in items:
-                if bot.adapter.get_name() == chat.adapter:
-                    return bot
-    return items[0]
+    for bot in _bots():
+        if str(bot.self_id) == self_id:
+            return bot
+    return None
+
+
+def _pick_bot(chat: ChatRecord | None, bots: list[Bot] | None = None) -> Bot | None:
+    """为一条会话挑选要使用的机器人。
+
+    会话 key 里内嵌了机器人 ID（``12345:group_678``），所以按它精确匹配
+    —— 这正是「会话按机器人隔离」的落点：给 A 机器人的群发消息，绝不能从
+    B 机器人发出去。拿不到会话或该机器人已离线时返回 None。
+    """
+    items = bots if bots is not None else _bots()
+    if not items or chat is None:
+        return None
+    # 会话所属机器人不在线：宁可失败也不要用别的机器人冒名发送
+    wanted = chat.self_id or self_id_of(chat.key)
+    if not wanted:
+        return None
+    for bot in items:
+        if str(bot.self_id) == wanted:
+            return bot
+    return None
+
+
+def _request_self_id(request: Request) -> str:
+    """从请求里读取前端当前选中的机器人 ID（``?bot=`` 或请求头）"""
+    supplied = request.query_params.get('bot', '') or request.headers.get(
+        'x-botui-bot', ''
+    )
+    return str(supplied or '').strip()
 
 
 def _make_target(chat: ChatRecord) -> Any:
@@ -237,11 +268,31 @@ async def get_meta(request: Request) -> dict[str, Any]:
                 'self_id': str(bot.self_id) if bot else None,
                 'adapter': bot.adapter.get_name() if bot else None,
                 'bots': [str(b.self_id) for b in bots],
+                # 连接过的全部机器人（含离线），供右上角切换器列表
+                'bot_list': [b.to_dict() for b in store.bots()],
                 'db': str(store.path),
                 'message_count': await store.count(),
             }
         )
     return data
+
+
+@router.get('/api/bots')
+async def get_bots(request: Request) -> dict[str, Any]:
+    """连接过的机器人清单（含在线标记）。
+
+    右上角的切换器用它列出所有机器人：「连接过」的概念存在 ``bots`` 表里，
+    机器人断开后仍然保留（``online=false``），因此列表不会因为离线而缩水。
+    """
+    _guard(request)
+    store = _require_store()
+    records = store.bots()
+    # 以 NoneBot 当前实际连接为准刷新在线状态：钩子可能因为异常漏掉一次事件，
+    # 这里按 ``get_bots()`` 校正，避免界面显示「离线」但实际还连着。
+    live = {str(b.self_id) for b in _bots()}
+    for record in records:
+        record.online = record.self_id in live
+    return {'bots': [b.to_dict() for b in records]}
 
 
 @router.get('/api/health')
@@ -259,11 +310,18 @@ async def get_chats(
     request: Request,
     q: str = Query('', max_length=100),
     limit: int = Query(200, ge=1, le=1000),
+    bot: str = Query('', max_length=64),
 ) -> dict[str, Any]:
+    """会话列表。
+
+    ``bot`` 是要筛选的机器人 ID（切换器选中的那个）：会话按机器人完全隔离，
+    只返回该机器人的会话。
+    """
     _guard(request)
     store = _require_store()
-    chats = store.chats(q, limit)
-    return {'chats': [c.to_dict() for c in chats]}
+    self_id = str(bot or _request_self_id(request) or '').strip()
+    chats = store.chats(q, limit, self_id=self_id if self_id else None)
+    return {'chats': [c.to_dict() for c in chats], 'bot': self_id or None}
 
 
 @router.get('/api/messages')
@@ -276,7 +334,7 @@ async def get_messages(
 ) -> dict[str, Any]:
     _guard(request)
     store = _require_store()
-    if store.chat(chat) is None and not chat.count('_'):
+    if store.chat(chat) is None and '_' not in chat:
         raise HTTPException(status_code=400, detail='会话 key 格式不正确')
     items = await store.messages(chat, limit, before, before_id)
     return {'messages': [m.to_dict() for m in items], 'chat': chat}
@@ -305,16 +363,23 @@ async def get_search(
     request: Request,
     q: str = Query(..., min_length=1, max_length=100),
     chat: str = Query('', max_length=200),
+    bot: str = Query('', max_length=64),
     limit: int = Query(100, ge=1, le=500),
 ) -> dict[str, Any]:
     """按内容搜索消息。
 
     界面上搜索框本来就写着「搜索会话 / 群号 / 消息」，之前只做了会话名的本地
     过滤，消息正文其实搜不到；这里补上真正的全文检索。
+
+    ``bot`` 限定只在某个机器人的消息里搜，避免切换机器人后搜出别的机器人的
+    聊天记录。
     """
     _guard(request)
     store = _require_store()
-    items = await store.search(q, limit, chat or None)
+    self_id = str(bot or _request_self_id(request) or '').strip()
+    items = await store.search(
+        q, limit, chat or None, self_id=self_id if self_id else None
+    )
     return {'query': q, 'messages': [m.to_dict() for m in items]}
 
 
@@ -479,13 +544,20 @@ async def post_send(request: Request) -> dict[str, Any]:
         kind, chat_id = split_chat_key(key)
         if not chat_id:
             raise HTTPException(status_code=400, detail='会话 key 格式不正确')
-        chat = ChatRecord(key=key, kind=kind, chat_id=chat_id)
+        chat = ChatRecord(key=key, kind=kind, chat_id=chat_id, self_id=self_id_of(key))
+    else:
+        # store 返回的是热缓存里的活对象，直接改它会污染缓存；复制一份再改。
+        chat = replace(chat)
 
     await _throttle(key)
 
     bot = _pick_bot(chat)
     if bot is None:
-        raise HTTPException(status_code=503, detail='当前没有已连接的机器人，无法发送')
+        # 会话指定了机器人但它当前不在线时，不要用别的机器人顶替——那会让
+        # 「A 机器人的群」里冒出 B 机器人发的消息。
+        raise HTTPException(
+            status_code=503, detail='该会话所属的机器人当前不在线，无法发送'
+        )
 
     try:
         receipt = await _send_via_bot(bot, chat, at_list, text, reply_to)
@@ -587,11 +659,16 @@ async def post_recall(request: Request) -> dict[str, Any]:
         )
 
     chat = store.chat(record.chat_key) or ChatRecord(
-        key=record.chat_key, kind=record.chat_kind, chat_id=record.chat_id
+        key=record.chat_key,
+        kind=record.chat_kind,
+        chat_id=record.chat_id,
+        self_id=record.self_id or self_id_of(record.chat_key),
     )
     bot = _pick_bot(chat)
     if bot is None:
-        raise HTTPException(status_code=503, detail='当前没有已连接的机器人，无法撤回')
+        raise HTTPException(
+            status_code=503, detail='该消息所属的机器人当前不在线，无法撤回'
+        )
 
     try:
         # 从 .adapters 导入而不是 uniseg 顶层：顶层那行是普通 import（没有

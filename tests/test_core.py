@@ -8,16 +8,32 @@ import pytest
 def test_chat_key_roundtrip():
     from nonebot_plugin_botui.models import chat_key, split_chat_key
 
-    key = chat_key('group', '87654321')
-    assert key == 'group_87654321'
+    key = chat_key('group', '87654321', '12345678')
+    assert key == '12345678:group_87654321'
     assert split_chat_key(key) == ('group', '87654321')
+
+
+def test_chat_key_with_self_id():
+    """带机器人 ID 的会话键：同一群在不同机器人下是两条独立会话。"""
+    from nonebot_plugin_botui.models import (
+        chat_key,
+        self_id_of,
+        split_chat_key,
+        split_chat_key_parts,
+    )
+
+    key = chat_key('group', '87654321', '12345678')
+    assert key == '12345678:group_87654321'
+    assert split_chat_key(key) == ('group', '87654321')
+    assert split_chat_key_parts(key) == ('12345678', 'group', '87654321')
+    assert self_id_of(key) == '12345678'
 
 
 def test_split_chat_key_with_underscore_in_id():
     from nonebot_plugin_botui.models import split_chat_key
 
     # 群号/频道 id 里可能带下划线，只按第一个下划线切分
-    assert split_chat_key('group_abc_def') == ('group', 'abc_def')
+    assert split_chat_key('123:group_abc_def') == ('group', 'abc_def')
 
 
 def test_describe_segments():
@@ -235,24 +251,32 @@ def test_config_route_normalization():
     ('api', 'data', 'expected'),
     [
         # OneBot V11
-        ('send_group_msg', {'group_id': 111, 'message': 'x'}, ('group_111', '111')),
-        ('send_private_msg', {'user_id': 222, 'message': 'x'}, ('private_222', '222')),
+        (
+            'send_group_msg',
+            {'group_id': 111, 'message': 'x'},
+            ('12345678:group_111', '111'),
+        ),
+        (
+            'send_private_msg',
+            {'user_id': 222, 'message': 'x'},
+            ('12345678:private_222', '222'),
+        ),
         # OneBot V12：接口统一叫 send_message，靠 detail_type 区分
         (
             'send_message',
             {'detail_type': 'group', 'group_id': '333', 'message': 'x'},
-            ('group_333', '333'),
+            ('12345678:group_333', '333'),
         ),
         (
             'send_message',
             {'detail_type': 'private', 'user_id': '444', 'message': 'x'},
-            ('private_444', '444'),
+            ('12345678:private_444', '444'),
         ),
         # 频道（guild/channel）也算群聊场景
         (
             'send_message',
             {'channel_id': '555', 'message': 'x'},
-            ('group_555', '555'),
+            ('12345678:group_555', '555'),
         ),
         # 认不出目标时返回 None，采集层会跳过而不是记到错误的会话里
         ('send_message', {'message': 'x'}, None),
@@ -269,7 +293,7 @@ def test_extract_target_across_adapters(api, data, expected):
     """跨平台的关键：不同适配器的发送参数形状差别很大，都要能认出会话。"""
     from nonebot_plugin_botui.capture import _extract_target
 
-    assert _extract_target(api, data) == expected
+    assert _extract_target(api, data, '12345678') == expected
 
 
 def test_version_is_consistent_across_files():

@@ -23,7 +23,7 @@ import nonebot
 from nonebot import logger
 
 from .config import plugin_config as cfg
-from .models import ChatRecord, MessageRecord
+from .models import BotRecord, ChatRecord, MessageRecord
 
 BUS_LIMIT = 2000  # 环形缓冲条数（断线重连时补发用）
 QUEUE_LIMIT = 500  # 单个连接的待发队列上限
@@ -126,6 +126,18 @@ class EventBus:
             }
         )
 
+    def publish_bot(self, bot: BotRecord) -> None:
+        """机器人上线/离线事件（WebUI 的切换器靠它刷新在线标记）"""
+        self._publish(
+            {
+                'type': 'bot',
+                'id': 0,
+                'message': None,
+                'chat': None,
+                'bot': bot.to_dict(),
+            }
+        )
+
     def backlog(self, since: int, until: int, limit: int = 500) -> list[dict[str, Any]]:
         """取 ``since < seq <= until`` 的事件（最多 ``limit`` 条）。
 
@@ -171,6 +183,9 @@ class WebUIServer:
 
     def publish_recall(self, row_id: int) -> None:
         self._bus.publish_recall(row_id)
+
+    def publish_bot(self, bot: BotRecord) -> None:
+        self._bus.publish_bot(bot)
 
     # ── 挂载 ────────────────────────────────────────────────────────────
     def mount(self) -> bool:

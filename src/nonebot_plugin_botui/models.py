@@ -39,15 +39,34 @@ def now_ts() -> float:
     return time.time()
 
 
-def chat_key(kind: str, chat_id: str) -> str:
-    """会话在数据库中的唯一键，例如 ``group_123456``"""
-    return f'{kind}_{chat_id}'
+def chat_key(kind: str, chat_id: str, self_id: str) -> str:
+    """会话在数据库中的唯一键，形如 ``12345678:group_123456``。
+
+    会话里内嵌机器人 ID，同一平台上的不同机器人各自维护一份会话，互不混淆。
+    """
+    return f'{self_id}:{kind}_{chat_id}'
+
+
+def split_chat_key_parts(key: str) -> tuple[str, str, str]:
+    """把 ``12345678:group_123456`` 拆成 ``('12345678', 'group', '123456')``。
+
+    会话 ID 本身可能含下划线（如 ``group_abc_def``），所以只按**第一个**
+    冒号切分前缀、按**第一个**下划线切分会话类型。
+    """
+    self_id, _, body = key.partition(':')
+    kind, _, chat_id = body.partition('_')
+    return self_id, (kind or KIND_GROUP), chat_id
 
 
 def split_chat_key(key: str) -> tuple[str, str]:
-    """把 ``group_123456`` 拆成 ``('group', '123456')``"""
-    kind, _, chat_id = key.partition('_')
-    return (kind or KIND_GROUP), chat_id
+    """把 ``12345678:group_123456`` 拆成 ``('group', '123456')``（丢掉机器人前缀）"""
+    _, kind, chat_id = split_chat_key_parts(key)
+    return kind, chat_id
+
+
+def self_id_of(key: str) -> str:
+    """取出会话 key 里内嵌的机器人 ID"""
+    return split_chat_key_parts(key)[0]
 
 
 def describe_segments(segments: list[dict[str, Any]]) -> str:
@@ -67,6 +86,32 @@ def describe_segments(segments: list[dict[str, Any]]) -> str:
             parts.append(SEGMENT_LABELS.get(stype, '[消息]'))
     text = ''.join(parts).strip()
     return ' '.join(text.split())
+
+
+@dataclass(slots=True)
+class BotRecord:
+    """一个连接过的机器人账号（WebUI 右上角的切换器用它列机器人）"""
+
+    self_id: str
+    adapter: str = ''
+    scope: str = ''
+    name: str = ''
+    avatar: str = ''
+    online: bool = False
+    first_seen: float = 0.0
+    last_seen: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            'self_id': self.self_id,
+            'adapter': self.adapter or None,
+            'scope': self.scope or None,
+            'name': self.name or self.self_id,
+            'avatar': self.avatar or None,
+            'online': bool(self.online),
+            'first_seen': self.first_seen,
+            'last_seen': self.last_seen,
+        }
 
 
 @dataclass(slots=True)

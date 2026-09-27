@@ -68,6 +68,16 @@
         <button class="icon-btn" id="reloadBtn" type="button" title="重新加载消息" aria-label="重新加载消息">
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20.2 4.4v4.2H16"/></svg>
         </button>
+
+        <!-- 机器人切换器：列出所有连接过的机器人，在线的标「在线」，会话按机器人区分 -->
+        <div class="bot-switch" id="botSwitch">
+          <button class="bot-btn" id="botBtn" type="button" aria-haspopup="true" aria-expanded="false" title="切换机器人">
+            <span class="dot dot-idle" id="botDot" aria-hidden="true"></span>
+            <span class="bot-btn-name" id="botBtnName">选择机器人</span>
+            <svg class="bot-caret" viewBox="0 0 24 24" aria-hidden="true"><path d="M6 9l6 6 6-6"/></svg>
+          </button>
+          <div class="bot-menu" id="botMenu" hidden role="menu" aria-label="选择机器人"></div>
+        </div>
       </header>
 
       <div class="msg-area">

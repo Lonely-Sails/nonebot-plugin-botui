@@ -18,10 +18,12 @@ from .models import (
     DIR_IN,
     KIND_GROUP,
     KIND_PRIVATE,
+    BotRecord,
     ChatRecord,
     MessageRecord,
     now_ts,
     chat_key,
+    self_id_of,
     split_chat_key,
 )
 
@@ -88,6 +90,20 @@ CREATE TABLE IF NOT EXISTS members (
     PRIMARY KEY (chat_key, user_id)
 );
 CREATE INDEX IF NOT EXISTS idx_members_chat ON members(chat_key, last_at DESC);
+
+-- 连接过的机器人账号。WebUI 右上角的切换器用它列出所有机器人并标记在线状态；
+-- 机器人断开后记录仍然保留（online=0），所以「连接过的」都能看到。
+CREATE TABLE IF NOT EXISTS bots (
+    self_id     TEXT PRIMARY KEY,
+    adapter     TEXT DEFAULT '',
+    scope       TEXT DEFAULT '',
+    name        TEXT DEFAULT '',
+    avatar      TEXT DEFAULT '',
+    online      INTEGER DEFAULT 0,
+    first_seen  REAL DEFAULT 0,
+    last_seen   REAL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_bots_last_seen ON bots(last_seen DESC);
 
 CREATE TABLE IF NOT EXISTS meta (
     key   TEXT PRIMARY KEY,
@@ -194,6 +210,8 @@ class MessageStore:
         self._chats: dict[str, ChatRecord] = {}
         # 会话成员热缓存：chat_key -> (user_id -> MemberRecord)
         self._members: dict[str, dict[str, MemberRecord]] = {}
+        # 连接过的机器人：self_id -> BotRecord（在线状态由连接钩子维护）
+        self._bots: dict[str, BotRecord] = {}
         # 每条记录落库后回调（用于推送给 WebUI 的增量事件流）
         self.on_insert: Any = None
 
@@ -271,6 +289,36 @@ class MessageStore:
             self._chats[chat.key] = chat
         logger.debug(f'Loaded {len(rows)} chat(s) into cache')
         await self._load_members()
+        await self._load_bots()
+
+    async def _load_bots(self) -> None:
+        """把连接过的机器人读进内存（启动时一律先标记为离线）。
+
+        在线状态由 ``Bot.on_connect`` / ``on_disconnect`` 钩子维护：进程刚起来
+        时还没有任何连接，所以先全部置为离线，等钩子把当前连上的机器人点亮。
+        """
+        if self._db is None:
+            return
+        try:
+            async with self._db.execute(
+                'SELECT * FROM bots ORDER BY last_seen DESC LIMIT 200'
+            ) as cur:
+                rows = list(await cur.fetchall())
+        except Exception as e:
+            logger.debug(f'Failed to load bot cache: {e}')
+            return
+        for row in rows:
+            self._bots[row['self_id']] = BotRecord(
+                self_id=row['self_id'],
+                adapter=row['adapter'] or '',
+                scope=row['scope'] or '',
+                name=row['name'] or '',
+                avatar=row['avatar'] or '',
+                online=False,
+                first_seen=row['first_seen'] or 0.0,
+                last_seen=row['last_seen'] or 0.0,
+            )
+        logger.debug(f'Loaded {len(self._bots)} bot(s) into cache')
 
     async def _load_members(self) -> None:
         """把最近活跃的成员名册读进内存（供 WebUI 的 @ 菜单用）"""
@@ -282,7 +330,7 @@ class MessageStore:
                 (_MEMBER_CACHE_LIMIT,),
             ) as cur:
                 rows = list(await cur.fetchall())
-        except Exception as e:  # pragma: no cover - 旧库没有该表时兜底
+        except Exception as e:
             logger.debug(f'Failed to load member cache: {e}')
             return
         for row in rows:
@@ -492,7 +540,9 @@ class MessageStore:
         key = rec.chat_key
         chat = self._chats.get(key)
         if chat is None:
-            chat = ChatRecord(key=key, kind=rec.chat_kind, chat_id=rec.chat_id)
+            chat = ChatRecord(
+                key=key, kind=rec.chat_kind, chat_id=rec.chat_id, self_id=rec.self_id
+            )
             self._chats[key] = chat
             while len(self._chats) > _CHAT_CACHE_LIMIT:
                 oldest = min(self._chats.values(), key=lambda c: c.last_at)
@@ -539,7 +589,9 @@ class MessageStore:
         kind, chat_id = split_chat_key(key)
         chat = self._chats.get(key)
         if chat is None:
-            chat = ChatRecord(key=key, kind=kind, chat_id=chat_id)
+            chat = ChatRecord(
+                key=key, kind=kind, chat_id=chat_id, self_id=self_id_of(key)
+            )
             self._chats[key] = chat
         chat.name = name or chat.name
         chat.avatar = avatar or chat.avatar
@@ -573,9 +625,16 @@ class MessageStore:
             logger.debug(f'Failed to touch chat {key}: {e}')
 
     # ── 读取 ────────────────────────────────────────────────────────────
-    def chats(self, query: str = '', limit: int = 200) -> list[ChatRecord]:
-        """从热缓存里取会话列表（已按最后消息时间倒序）"""
+    def chats(
+        self, query: str = '', limit: int = 200, self_id: str | None = None
+    ) -> list[ChatRecord]:
+        """从热缓存里取会话列表（已按最后消息时间倒序）。
+
+        ``self_id`` 不为 None 时只返回属于该机器人的会话。
+        """
         items = sorted(self._chats.values(), key=lambda c: c.last_at, reverse=True)
+        if self_id is not None:
+            items = [c for c in items if c.self_id == self_id]
         if query:
             q = query.lower()
             items = [
@@ -589,6 +648,91 @@ class MessageStore:
 
     def chat(self, key: str) -> ChatRecord | None:
         return self._chats.get(key)
+
+    # ── 机器人账号 ──────────────────────────────────────────────────────
+    def bots(self) -> list[BotRecord]:
+        """所有连接过的机器人，在线的排前面，其次按最近活跃倒序。"""
+        items = sorted(
+            self._bots.values(),
+            key=lambda b: (b.online, b.last_seen),
+            reverse=True,
+        )
+        return items
+
+    def bot(self, self_id: str) -> BotRecord | None:
+        return self._bots.get(str(self_id))
+
+    async def upsert_bot(
+        self,
+        self_id: str,
+        *,
+        adapter: str = '',
+        scope: str = '',
+        name: str = '',
+        avatar: str = '',
+        online: bool | None = None,
+    ) -> BotRecord:
+        """记录/更新一个机器人账号，返回更新后的记录。
+
+        ``online`` 为 None 表示不改动在线状态（例如只是补昵称）；字段为空的
+        参数不会覆盖已有值（COALESCE 风格），免得一次降级的适配器信息把之前
+        记下的昵称、头像抹掉。
+        """
+        self_id = str(self_id or '')
+        if not self_id:
+            raise ValueError('self_id is required')
+        now = now_ts()
+        record = self._bots.get(self_id)
+        if record is None:
+            record = BotRecord(self_id=self_id, first_seen=now, last_seen=now)
+            self._bots[self_id] = record
+        record.adapter = adapter or record.adapter
+        record.scope = scope or record.scope
+        record.name = name or record.name
+        record.avatar = avatar or record.avatar
+        if online is not None:
+            record.online = bool(online)
+        record.last_seen = max(now, record.last_seen)
+
+        if self._db is None:
+            return record
+        try:
+            async with self._lock:
+                await self._db.execute(
+                    """
+                    INSERT INTO bots (self_id, adapter, scope, name, avatar,
+                                      online, first_seen, last_seen)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(self_id) DO UPDATE SET
+                        adapter = COALESCE(NULLIF(excluded.adapter, ''), bots.adapter),
+                        scope = COALESCE(NULLIF(excluded.scope, ''), bots.scope),
+                        name = COALESCE(NULLIF(excluded.name, ''), bots.name),
+                        avatar = COALESCE(NULLIF(excluded.avatar, ''), bots.avatar),
+                        online = excluded.online,
+                        last_seen = MAX(excluded.last_seen, bots.last_seen)
+                    """,
+                    (
+                        self_id,
+                        record.adapter,
+                        record.scope,
+                        record.name,
+                        record.avatar,
+                        1 if record.online else 0,
+                        record.first_seen,
+                        record.last_seen,
+                    ),
+                )
+                await self._db.commit()
+        except Exception as e:  # pragma: no cover - 机器人信息写入失败不影响主流程
+            logger.debug(f'Failed to upsert bot {self_id}: {e}')
+        return record
+
+    async def set_bot_online(self, self_id: str, online: bool) -> BotRecord | None:
+        """更新机器人在线状态（连接钩子调用）"""
+        self_id = str(self_id or '')
+        if not self_id:
+            return None
+        return await self.upsert_bot(self_id, online=online)
 
     # ── 成员名册 ────────────────────────────────────────────────────────
     def members(
@@ -710,11 +854,15 @@ class MessageStore:
         keyword: str,
         limit: int = 100,
         chat_key: str | None = None,
+        self_id: str | None = None,
     ) -> list[MessageRecord]:
         """按关键词搜索消息内容（不区分大小写），按时间倒序返回。
 
         ``keyword`` 里的 ``%`` ``_`` 是 LIKE 的通配符，必须转义掉，否则用户
         搜一个 ``%`` 会把所有消息都捞出来。
+
+        ``self_id`` 不为 None 时只在指定机器人的消息里搜：会话 key 以
+        ``self_id:`` 开头，因此用前缀匹配即可。
         """
         if self._db is None:
             return []
@@ -725,19 +873,20 @@ class MessageStore:
         # 转义 LIKE 元字符：先用 \ 转义，再声明 ESCAPE '\'
         escaped = keyword.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
         pattern = f'%{escaped}%'
+        clauses = ['recalled = 0', "text LIKE ? ESCAPE '\\'"]
+        params: list[Any] = [pattern]
         if chat_key:
-            sql = (
-                'SELECT * FROM messages WHERE recalled = 0 AND chat_key = ? '
-                "AND text LIKE ? ESCAPE '\\' ORDER BY ts DESC, id DESC LIMIT ?"
-            )
-            params: tuple[Any, ...] = (chat_key, pattern, limit)
-        else:
-            sql = (
-                'SELECT * FROM messages WHERE recalled = 0 '
-                "AND text LIKE ? ESCAPE '\\' ORDER BY ts DESC, id DESC LIMIT ?"
-            )
-            params = (pattern, limit)
-        async with self._db.execute(sql, params) as cur:
+            clauses.append('chat_key = ?')
+            params.append(chat_key)
+        elif self_id is not None:
+            clauses.append('chat_key LIKE ?')
+            params.append(f'{self_id}:%')
+        params.append(limit)
+        sql = (
+            f'SELECT * FROM messages WHERE {" AND ".join(clauses)} '
+            'ORDER BY ts DESC, id DESC LIMIT ?'
+        )
+        async with self._db.execute(sql, tuple(params)) as cur:
             rows = await cur.fetchall()
         return [self._row_to_message(r) for r in rows]
 
@@ -771,22 +920,17 @@ class MessageStore:
             )
             await self._db.commit()
 
-    async def count(self) -> int:
+    async def count(self, self_id: str | None = None) -> int:
         if self._db is None:
             return 0
-        async with self._db.execute('SELECT COUNT(*) AS n FROM messages') as cur:
+        if self_id is None:
+            sql, params = 'SELECT COUNT(*) AS n FROM messages', ()
+        else:
+            sql = 'SELECT COUNT(*) AS n FROM messages WHERE chat_key LIKE ?'
+            params = (f'{self_id}:%',)
+        async with self._db.execute(sql, params) as cur:
             row = await cur.fetchone()
         return int(row['n']) if row else 0
-
-    async def self_ids(self) -> list[str]:
-        """出现过的机器人账号"""
-        if self._db is None:
-            return []
-        async with self._db.execute(
-            "SELECT DISTINCT self_id FROM chats WHERE self_id != '' LIMIT 20"
-        ) as cur:
-            rows = await cur.fetchall()
-        return [str(r['self_id']) for r in rows]
 
     # ── 维护 ────────────────────────────────────────────────────────────
     async def cleanup(self) -> int:
@@ -843,6 +987,7 @@ class MessageStore:
             await self._db.execute('DELETE FROM messages')
             await self._db.execute('DELETE FROM chats')
             await self._db.execute('DELETE FROM members')
+            # 机器人记录保留：它表示「连接过的账号」，不属于聊天内容
             # 让行号从头开始，避免「清空后第一条消息的 id 还是很大」
             await self._db.execute(
                 "DELETE FROM sqlite_sequence WHERE name IN ('messages', 'chats')"
@@ -877,7 +1022,9 @@ class MessageStore:
 def record_from_session(session: Any, direction: str = DIR_IN) -> MessageRecord:
     kind = KIND_PRIVATE if getattr(session.scene, 'is_private', False) else KIND_GROUP
     chat_id = str(session.scene.id)
-    key = chat_key(kind, chat_id)
+    self_id = str(getattr(session, 'self_id', '') or '')
+    # 会话 key 带上机器人 ID：同一平台的多个机器人各自一份会话，互不混淆
+    key = chat_key(kind, chat_id, self_id)
     parent_id = str(getattr(session.scene.parent, 'id', '') or '')
     member_count = getattr(session.scene, 'member_count', None)
     return MessageRecord(
@@ -888,7 +1035,7 @@ def record_from_session(session: Any, direction: str = DIR_IN) -> MessageRecord:
         ts=now_ts(),
         adapter=str(getattr(session, 'adapter', '') or ''),
         scope=str(getattr(session, 'scope', '') or ''),
-        self_id=str(getattr(session, 'self_id', '') or ''),
+        self_id=self_id,
         parent_id=parent_id,
         chat_name=str(getattr(session.scene, 'name', '') or ''),
         chat_avatar=avatar_of(getattr(session.scene, 'avatar', None)),

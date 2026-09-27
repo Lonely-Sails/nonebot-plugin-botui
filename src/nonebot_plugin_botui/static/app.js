@@ -24,6 +24,7 @@ const API_BASE = new URL('api/', document.baseURI).href.replace(/\/$/, '');
 
 const TOKEN_KEY = 'botui_token';
 const THEME_KEY = 'botui_theme';
+const BOT_KEY = 'botui_bot';   // 当前选中的机器人（会话按机器人区分）
 
 const PAGE_LIMIT_FALLBACK = 50;  // 每次拉取消息条数（后端可用 BOTUI_PAGE_SIZE 覆盖）
 const MSG_MAX = 1200;       // 前端保留的最大消息数
@@ -38,6 +39,10 @@ const state = {
   token: '',                // 访问令牌
   gateOpen: false,          // 令牌页是否显示
   gateFrom401: false,       // 令牌页是否由 401 触发
+
+  bots: [],                 // 连接过的机器人（含在线状态）
+  botId: '',                // 当前选中的机器人 self_id（会话按它区分）
+  botMenuOpen: false,       // 机器人切换菜单是否展开
 
   chats: [],                // 会话列表（按时间倒序）
   chatMap: new Map(),       // key -> 会话
@@ -99,6 +104,11 @@ const el = {
   connMeta: $('connMeta'),
   backBtn: $('backBtn'),
   reloadBtn: $('reloadBtn'),
+  botSwitch: $('botSwitch'),
+  botBtn: $('botBtn'),
+  botDot: $('botDot'),
+  botBtnName: $('botBtnName'),
+  botMenu: $('botMenu'),
   headAvatar: $('headAvatar'),
   headName: $('headName'),
   headKind: $('headKind'),
@@ -321,13 +331,16 @@ function legacyCopy(text, done) {
 
 /**
  * 统一请求封装：
- *  - 每个请求都带 X-BotUI-Token
+ *  - 每个请求都带 X-BotUI-Token 与 X-BotUI-Bot（当前选中的机器人）
  *  - 非 2xx 时解析 {"ok":false,"error":"..."} 并抛出可读错误
  *  - 401 统一弹出令牌页
  */
 async function api(path, options) {
   const opts = options || {};
   const headers = { 'X-BotUI-Token': state.token || '' };
+  // 后端按这个请求头把会话/搜索限定在当前机器人名下（会话按机器人区分）。
+  // 用请求头而不是拼进 query，省得每个调用点都要记得带上。
+  if (state.botId) headers['X-BotUI-Bot'] = state.botId;
   if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
 
   let res;
@@ -391,6 +404,19 @@ function readStoredToken() {
 function saveToken(value) {
   state.token = value;
   try { localStorage.setItem(TOKEN_KEY, value); } catch (err) { /* 忽略 */ }
+}
+
+/* --- 机器人选择：会话按机器人区分，选中项记在本地 --- */
+function readStoredBot() {
+  try { return localStorage.getItem(BOT_KEY) || ''; } catch (err) { return ''; }
+}
+
+function saveBot(selfId) {
+  state.botId = selfId || '';
+  try {
+    if (state.botId) localStorage.setItem(BOT_KEY, state.botId);
+    else localStorage.removeItem(BOT_KEY);
+  } catch (err) { /* 忽略 */ }
 }
 
 /* --- 主题：默认深色，浅色通过 html[data-theme] --- */
@@ -483,8 +509,16 @@ function renderConnMeta() {
   const meta = state.meta;
   if (!meta || state.gateOpen) { el.connMeta.textContent = ''; return; }
   const parts = [];
-  if (hasText(meta.self_id)) parts.push('机器人 ' + meta.self_id);
-  if (hasText(meta.adapter)) parts.push(String(meta.adapter));
+  // 显示的是「当前选中的机器人」，而不是 meta 里那个随机的——否则切换后
+  // 页脚还写着别的机器人，看着像没切成功。
+  const selected = currentBot();
+  if (selected) {
+    parts.push(botLabel(selected.self_id));
+    if (hasText(selected.adapter)) parts.push(String(selected.adapter));
+    parts.push(selected.online ? '在线' : '离线');
+  } else if (state.botId) {
+    parts.push('机器人 ' + state.botId);
+  }
   if (hasText(meta.version)) parts.push('v' + meta.version);
   el.connMeta.textContent = parts.join(' · ');
 }
@@ -518,10 +552,193 @@ function applyMeta() {
   const ps = Number(meta.page_size);
   state.pageSize = Number.isFinite(ps) && ps > 0 ? Math.floor(ps) : PAGE_LIMIT_FALLBACK;
 
+  // 机器人列表：/meta 在鉴权通过时会带上 bot_list（含在线状态），
+  // 用它初始化切换器；之后再靠 /bots 与 WebSocket 事件刷新。
+  if (Array.isArray(meta.bot_list)) setBots(meta.bot_list);
+
   document.title = (hasText(meta.name) ? String(meta.name) : 'BotUI') + ' · 消息控制台';
   renderConnMeta();
   if (!state.gateOpen) statusOk();
   if (state.chats.length) renderChats();
+}
+
+/* ====================== 4b. 机器人切换器（右上角） ======================
+   会话按机器人区分：切换器决定了 /chats、/search 与发送时用的 self_id。
+   列表来自后端记录的全部「连接过的机器人」（含已离线的），在线状态实时更新。 */
+
+/** 从 /meta 或 /bots 的结果里接管机器人列表，并修正当前选中项 */
+function setBots(list) {
+  const items = Array.isArray(list) ? list.filter((b) => b && hasText(b.self_id)) : [];
+  state.bots = items.map((b) => Object.assign({}, b, { self_id: String(b.self_id) }));
+
+  const ids = state.bots.map((b) => b.self_id);
+  let current = state.botId;
+  if (!current || ids.indexOf(current) < 0) {
+    // 优先沿用本地记住的；否则选第一个在线的，再退到列表第一个
+    const remembered = readStoredBot();
+    if (remembered && ids.indexOf(remembered) >= 0) {
+      current = remembered;
+    } else {
+      const online = state.bots.find((b) => b.online);
+      current = online ? online.self_id : (ids.length ? ids[0] : '');
+    }
+    saveBot(current);
+  }
+  renderBotSwitch();
+  return current;
+}
+
+function currentBot() {
+  if (!state.botId) return null;
+  return state.bots.find((b) => b.self_id === state.botId) || null;
+}
+
+/** 更新 /api/bots 拿到的机器人（含在线状态），保持当前选中不变 */
+function mergeBots(list) {
+  const items = Array.isArray(list) ? list.filter((b) => b && hasText(b.self_id)) : [];
+  state.bots = items.map((b) => Object.assign({}, b, { self_id: String(b.self_id) }));
+  renderBotSwitch();
+}
+
+function renderBotSwitch() {
+  const bot = currentBot();
+  const name = bot ? (hasText(bot.name) ? String(bot.name) : bot.self_id) : (state.botId || '选择机器人');
+
+  el.botBtnName.textContent = state.bots.length ? name : '无机器人';
+  el.botBtn.title = bot
+    ? (name + ' · ' + bot.self_id + (bot.online ? ' · 在线' : ' · 离线'))
+    : '切换机器人';
+  el.botDot.className = 'dot ' + (bot && bot.online ? 'dot-ok' : 'dot-idle');
+
+  if (!el.botMenu.hidden) renderBotMenu();
+}
+
+function renderBotMenu() {
+  const menu = el.botMenu;
+  menu.textContent = '';
+
+  if (!state.bots.length) {
+    menu.appendChild(h('div', 'bot-menu-empty', '还没有连接过任何机器人'));
+    return;
+  }
+
+  state.bots.forEach((bot) => {
+    const name = hasText(bot.name) ? String(bot.name) : bot.self_id;
+    const active = bot.self_id === state.botId;
+    const item = h('button', 'bot-item' + (active ? ' active' : ''));
+    item.type = 'button';
+    item.setAttribute('role', 'menuitemradio');
+    item.setAttribute('aria-checked', active ? 'true' : 'false');
+    item.dataset.selfId = bot.self_id;
+
+    item.appendChild(buildAvatar(name, bot.avatar, 'sm'));
+
+    const main = h('div', 'bot-item-main');
+    main.appendChild(h('div', 'bot-item-name', name));
+    const sub = [bot.self_id];
+    if (hasText(bot.adapter)) sub.push(String(bot.adapter));
+    main.appendChild(h('div', 'bot-item-sub', sub.join(' · ')));
+    item.appendChild(main);
+
+    const stateTag = h('span', 'bot-state' + (bot.online ? ' online' : ''));
+    stateTag.appendChild(h('span', 'dot ' + (bot.online ? 'dot-ok' : 'dot-idle')));
+    stateTag.appendChild(h('span', null, bot.online ? '在线' : '离线'));
+    item.appendChild(stateTag);
+
+    if (active) item.appendChild(iconCheck());
+
+    item.addEventListener('click', () => {
+      closeBotMenu();
+      selectBot(bot.self_id);
+    });
+    menu.appendChild(item);
+  });
+}
+
+function iconCheck() {
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  svg.setAttribute('class', 'bot-check');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+  path.setAttribute('d', 'M5 12.5l4.5 4.5L19 7.5');
+  svg.appendChild(path);
+  return svg;
+}
+
+function openBotMenu() {
+  if (!el.botMenu.hidden) return;
+  renderBotMenu();
+  el.botMenu.hidden = false;
+  state.botMenuOpen = true;
+  el.botBtn.setAttribute('aria-expanded', 'true');
+}
+
+function closeBotMenu() {
+  if (el.botMenu.hidden) return;
+  el.botMenu.hidden = true;
+  state.botMenuOpen = false;
+  el.botBtn.setAttribute('aria-expanded', 'false');
+}
+
+function toggleBotMenu() {
+  if (el.botMenu.hidden) openBotMenu();
+  else closeBotMenu();
+}
+
+/**
+ * 切换机器人：会话与消息都按机器人区分，所以整页要重来一遍——
+ * 清空当前会话、重新拉会话列表，并让 WebSocket 只订阅该机器人的事件。
+ */
+async function selectBot(selfId) {
+  const next = String(selfId || '');
+  if (next === state.botId) return;
+  saveBot(next);
+
+  // 丢弃属于上一个机器人的一切：当前会话、消息、未读与搜索
+  state.current = null;
+  state.messages = [];
+  state.msgMap.clear();
+  state.chats = [];
+  state.chatMap.clear();
+  state.unread.clear();
+  state.pending.clear();
+  state.searchHits = [];
+  state.focusMsgId = null;
+  state.replyTo = null;
+  state.pendingAt = [];
+  state.newCount = 0;
+  el.app.dataset.pane = 'sidebar';
+  el.msgList.textContent = '';
+  el.searchInput.value = '';
+  state.search = '';
+  renderBotSwitch();
+  renderChats();
+  renderHead();
+
+  try {
+    await loadChats();
+    renderConnMeta();
+  } catch (err) {
+    if (!err || err.status !== 401) statusErr(err && err.message ? err.message : '切换机器人失败');
+  }
+  toast('已切换到 ' + botLabel(state.botId));
+}
+
+function botLabel(selfId) {
+  const bot = state.bots.find((b) => b.self_id === selfId);
+  if (!bot) return selfId || '机器人';
+  return hasText(bot.name) ? String(bot.name) : bot.self_id;
+}
+
+/** 拉取全部「连接过的机器人」并刷新列表（含在线状态） */
+async function loadBots() {
+  try {
+    const data = await api('/bots');
+    if (data && Array.isArray(data.bots)) mergeBots(data.bots);
+  } catch (err) {
+    // 拉不到就保持现有列表，等下一次事件或重连再刷新
+  }
 }
 
 /* ============================ 5. 会话列表 ============================ */
@@ -1796,6 +2013,7 @@ async function resync(since, silent) {
   state.syncing = true;
   state.resyncLast = Date.now();
   try {
+    await loadBots();
     await loadChats();
     if (state.current) {
       const key = state.current.key;
@@ -1853,9 +2071,17 @@ function handleEvent(ev) {
     if (seq > state.since) state.since = seq;
   }
 
+  // 机器人上线/离线：更新切换器里的在线标记
+  if (ev.type === 'bot' && ev.bot && hasText(ev.bot.self_id)) {
+    applyBotEvent(ev.bot);
+    return;
+  }
+
   if (ev.type === 'message' && ev.message) {
     const msg = ev.message;
     const key = String(msg.chat);
+    // 会话 key 里内嵌了机器人 ID，只处理当前选中机器人的消息
+    if (botOfKey(key) !== state.botId) return;
     const isOpen = !!(state.current && state.current.key === key);
 
     if (isOpen) {
@@ -1872,8 +2098,39 @@ function handleEvent(ev) {
   }
 
   if (ev.type === 'recall' && ev.id !== undefined && ev.id !== null) {
+    // 撤回事件只带行号；不属于当前机器人时直接忽略（removeMessage 找不到也不会出错）
     removeMessage(ev.id);
   }
+}
+
+/** 从会话 key（``12345:group_678``）里取出机器人 ID */
+function botOfKey(key) {
+  const text = String(key || '');
+  const idx = text.indexOf(':');
+  return idx > 0 ? text.slice(0, idx) : '';
+}
+
+/** 更新单个机器人的在线状态（WebSocket 推来的 bot 事件） */
+function applyBotEvent(bot) {
+  const selfId = String(bot.self_id);
+  const existing = state.bots.find((b) => b.self_id === selfId);
+  if (existing) {
+    existing.online = !!bot.online;
+    if (hasText(bot.name)) existing.name = String(bot.name);
+    if (bot.avatar !== undefined && bot.avatar !== null) existing.avatar = bot.avatar;
+    if (hasText(bot.adapter)) existing.adapter = String(bot.adapter);
+  } else {
+    state.bots.unshift(Object.assign({}, bot, { self_id: selfId }));
+    // 之前一个机器人都没有时，新上线的机器人自动成为当前选中项
+    if (!state.botId) {
+      saveBot(selfId);
+      renderBotSwitch();
+      loadChats().catch(() => { /* 静默失败 */ });
+      return;
+    }
+  }
+  renderBotSwitch();
+  renderConnMeta();
 }
 
 /** 合并事件携带的会话信息（新会话自动补入列表） */
@@ -1904,7 +2161,10 @@ function mergeChat(chat) {
 async function enterApp() {
   state.started = true;
   state.online = false;
+  // 先对齐机器人列表：/chats 要按选中的机器人过滤，所以顺序不能反
+  await loadBots();
   await loadChats();
+  renderConnMeta();
   startRealtime();
 }
 
@@ -1987,6 +2247,17 @@ function bindEvents() {
 
   el.reloadBtn.addEventListener('click', () => { reloadCurrent(); });
 
+  // 机器人切换器：点按钮开合菜单，点菜单项切换
+  el.botBtn.addEventListener('click', (ev) => {
+    ev.stopPropagation();
+    toggleBotMenu();
+  });
+  el.botMenu.addEventListener('click', (ev) => {
+    // 菜单项自己绑了 click；这里兜一层 stopPropagation，避免被 document
+    // 那个「点空白就关」的监听器抢先关掉再触发
+    ev.stopPropagation();
+  });
+
   // 消息区：加载更早 / 定位被回复消息 / 复制卡片
   el.msgList.addEventListener('click', (ev) => {
     if (closestFrom(ev.target, '#loadMoreBtn')) { loadOlder(); return; }
@@ -2057,17 +2328,20 @@ function bindEvents() {
     if (ev.key !== 'Escape') return;
     if (!el.lightbox.hidden) { closeLightbox(); return; }
     if (!el.atMenu.hidden) { closeAtMenu(); return; }
+    if (!el.botMenu.hidden) { closeBotMenu(); return; }
     closeCtxMenu();
   });
   document.addEventListener('click', (ev) => {
     if (!el.atMenu.hidden && !el.atMenu.contains(ev.target) && ev.target !== el.atBtn) {
       closeAtMenu();
     }
+    // 点切换器按钮或其菜单之外的任何地方都收起菜单
+    if (!el.botMenu.hidden && !el.botSwitch.contains(ev.target)) closeBotMenu();
     if (el.ctxMenu.hidden) return;
     if (!el.ctxMenu.contains(ev.target)) closeCtxMenu();
   });
-  window.addEventListener('resize', () => { closeAtMenu(); closeCtxMenu(); });
-  window.addEventListener('blur', closeCtxMenu);
+  window.addEventListener('resize', () => { closeAtMenu(); closeCtxMenu(); closeBotMenu(); });
+  window.addEventListener('blur', () => { closeCtxMenu(); closeBotMenu(); });
 
   // 页面重新可见时补一次同步：后台标签页的定时器会被浏览器节流，
   // 长连接也可能已经被中间设备掐掉，回来先对齐再继续。

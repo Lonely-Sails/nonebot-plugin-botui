@@ -35,8 +35,10 @@ async def seeded(botui):
     store = botui._get_store()
     await store.reset()
 
-    key = chat_key('group', str(GROUP_ID))
-    chat = ChatRecord(key=key, kind='group', chat_id=str(GROUP_ID), name='测试群')
+    key = chat_key('group', str(GROUP_ID), BOT_ID)
+    chat = ChatRecord(
+        key=key, kind='group', chat_id=str(GROUP_ID), self_id=BOT_ID, name='测试群'
+    )
 
     store.enqueue(
         MessageRecord(
@@ -1057,7 +1059,7 @@ def test_make_target_accepts_uninfo_scope_verbatim(botui):
     from src.nonebot_plugin_botui.models import ChatRecord
 
     chat = ChatRecord(
-        key='group_123',
+        key='999:group_123',
         kind='group',
         chat_id='123',
         scope='QQClient',
@@ -1070,7 +1072,183 @@ def test_make_target_accepts_uninfo_scope_verbatim(botui):
     assert target.scope == 'QQClient'
 
     private = _make_target(
-        ChatRecord(key='private_7', kind='private', chat_id='7', scope='Telegram')
+        ChatRecord(key='999:private_7', kind='private', chat_id='7', scope='Telegram')
     )
     assert private.private is True
     assert private.scope == 'Telegram'
+
+
+# ── 多机器人：切换、在线标记与会话隔离 ─────────────────────────────────
+BOT_B_ID = '876543210'
+
+
+async def test_bots_endpoint_lists_connected_bots(client: AsyncClient, seeded):
+    """切换器要能列出所有连接过的机器人，并标出在线状态。"""
+    store, _ = seeded
+    await store.upsert_bot(BOT_ID, adapter='OneBot V11', online=True)
+    await store.upsert_bot(BOT_B_ID, adapter='OneBot V11', online=False)
+
+    resp = await client.get('/botui/api/bots', headers=HEADERS)
+    assert resp.status_code == 200
+    bots = {b['self_id']: b for b in resp.json()['bots']}
+    assert set(bots) == {BOT_ID, BOT_B_ID}
+    assert isinstance(bots[BOT_ID]['online'], bool)
+    # 离线机器人仍然在列表里（「连接过」的都要保留）
+    assert bots[BOT_B_ID]['online'] is False
+
+
+async def test_bots_requires_token(client: AsyncClient):
+    assert (await client.get('/botui/api/bots')).status_code == 401
+
+
+async def test_chats_are_scoped_per_bot(client: AsyncClient, seeded):
+    """同一群在 A、B 两个机器人下是两条会话，切换机器人互不干扰。"""
+    from src.nonebot_plugin_botui.models import MessageRecord, now_ts, chat_key
+
+    store, key_a = seeded
+    key_b = chat_key('group', str(GROUP_ID), BOT_B_ID)
+    store.enqueue(
+        MessageRecord(
+            chat_key=key_b,
+            chat_kind='group',
+            chat_id=str(GROUP_ID),
+            chat_name='测试群',
+            direction='in',
+            ts=now_ts(),
+            self_id=BOT_B_ID,
+            user_id='10001',
+            user_name='小明',
+            text='B 机器人收到的',
+            segments=[{'type': 'text', 'text': 'B 机器人收到的'}],
+        )
+    )
+    await store.flush()
+
+    # 按 A 过滤只看得到 A 的会话
+    data_a = (
+        await client.get('/botui/api/chats', params={'bot': BOT_ID}, headers=HEADERS)
+    ).json()
+    keys_a = {c['key'] for c in data_a['chats']}
+    assert key_a in keys_a
+    assert key_b not in keys_a
+
+    # 按 B 过滤只看得到 B 的会话
+    data_b = (
+        await client.get('/botui/api/chats', params={'bot': BOT_B_ID}, headers=HEADERS)
+    ).json()
+    keys_b = {c['key'] for c in data_b['chats']}
+    assert key_b in keys_b
+    assert key_a not in keys_b
+
+
+async def test_search_is_scoped_per_bot(client: AsyncClient, seeded):
+    """切换机器人后，正文搜索不能搜出别的机器人的聊天记录。"""
+    from src.nonebot_plugin_botui.models import MessageRecord, now_ts, chat_key
+
+    store, _ = seeded
+    store.enqueue(
+        MessageRecord(
+            chat_key=chat_key('group', '999', BOT_B_ID),
+            chat_kind='group',
+            chat_id='999',
+            direction='in',
+            ts=now_ts(),
+            self_id=BOT_B_ID,
+            user_id='1',
+            user_name='路人',
+            text='只在 B 里出现的关键词',
+            segments=[{'type': 'text', 'text': '只在 B 里出现的关键词'}],
+        )
+    )
+    await store.flush()
+
+    # 用 A 的 id 搜不到 B 的消息
+    none_a = (
+        await client.get(
+            '/botui/api/search',
+            params={'q': '只在', 'bot': BOT_ID},
+            headers=HEADERS,
+        )
+    ).json()
+    assert none_a['messages'] == []
+
+    # 用 B 的 id 能搜到
+    hit_b = (
+        await client.get(
+            '/botui/api/search',
+            params={'q': '只在', 'bot': BOT_B_ID},
+            headers=HEADERS,
+        )
+    ).json()
+    assert [m['text'] for m in hit_b['messages']] == ['只在 B 里出现的关键词']
+
+
+async def test_meta_exposes_bot_list(client: AsyncClient, seeded):
+    """/meta（带令牌）要带上机器人清单，前端首屏就能渲染切换器。"""
+    store, _ = seeded
+    await store.upsert_bot(BOT_ID, adapter='OneBot V11', online=True)
+    data = (await client.get('/botui/api/meta', headers=HEADERS)).json()
+    assert 'bot_list' in data
+    assert any(b['self_id'] == BOT_ID for b in data['bot_list'])
+
+
+async def test_send_prefers_chat_own_bot(client: AsyncClient, botui, seeded):
+    """给 A 机器人的会话发消息，必须用 A 发送，不能落到 B 头上。"""
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot, Adapter
+
+    _, key = seeded  # key 属于 BOT_ID
+
+    sent: list[str] = []
+
+    async def fake_call_api(bot, api, **data):
+        sent.append(str(bot.self_id))
+        return {'message_id': 9300, 'status': 'ok'}
+
+    adapter = nonebot.get_adapter(Adapter)
+    bot_a = Bot(adapter, self_id=BOT_ID)
+    bot_b = Bot(adapter, self_id=BOT_B_ID)
+    original = adapter._call_api
+    adapter._call_api = fake_call_api  # type: ignore[method-assign]
+    adapter.bot_connect(bot_a)
+    adapter.bot_connect(bot_b)
+    try:
+        resp = await client.post(
+            '/botui/api/send',
+            headers=HEADERS,
+            json={'chat': key, 'text': '你好'},
+        )
+        assert resp.status_code == 200
+    finally:
+        adapter.bot_disconnect(bot_a)
+        adapter.bot_disconnect(bot_b)
+        adapter._call_api = original
+
+    assert sent == [BOT_ID], '会话内嵌的机器人 ID 决定了由谁发送'
+
+
+async def test_send_fails_when_own_bot_offline(client: AsyncClient, botui, seeded):
+    """会话所属机器人不在线时宁可失败，也不能用别的机器人冒名发送。"""
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot, Adapter
+
+    _, key = seeded  # 属于 BOT_ID
+
+    async def fake_call_api(_bot, api, **data):
+        return {'message_id': 9400, 'status': 'ok'}
+
+    adapter = nonebot.get_adapter(Adapter)
+    bot_b = Bot(adapter, self_id=BOT_B_ID)  # 只有 B 在线
+    original = adapter._call_api
+    adapter._call_api = fake_call_api  # type: ignore[method-assign]
+    adapter.bot_connect(bot_b)
+    try:
+        resp = await client.post(
+            '/botui/api/send',
+            headers=HEADERS,
+            json={'chat': key, 'text': '你好'},
+        )
+        assert resp.status_code == 503
+    finally:
+        adapter.bot_disconnect(bot_b)
+        adapter._call_api = original

@@ -112,6 +112,107 @@ def _on_record_inserted(record: MessageRecord) -> None:
         _server.publish_message(record, _store.chat(record.chat_key))
 
 
+def _bot_info(bot) -> dict[str, str]:
+    """凑出机器人的展示信息（昵称 / 头像 / 适配器）。
+
+    昵称/头像只从适配器**真实存在**的属性里读（如 OneBot 的 ``bot.self_info``、
+    其他适配器的 ``bot.info``）。**不能**用 ``getattr(bot, 'nickname', '')`` 这种
+    写法：NoneBot 的基类 ``Bot`` 重写了 ``__getattr__``，任何未知属性都会返回
+    ``partial(bot.call_api, name)``，于是默认值永远不会生效，界面上就会出现
+    ``functools.partial(<bound method Bot.call_api ...>)``。因此这里先用
+    ``type(bot)`` / ``vars(bot)`` 判定属性确实存在，取不到就留空，交给前端用
+    ``self_id`` 顶替显示。
+
+    这里刻意**不**主动调适配器接口去查昵称：连接钩子里多发一次 API 调用既可能
+    拖慢上线，也会打乱调用方的调用序列，得不偿失。
+    """
+    info: dict[str, str] = {'self_id': str(getattr(bot, 'self_id', '') or '')}
+    try:
+        info['adapter'] = bot.adapter.get_name()
+    except Exception:
+        info['adapter'] = ''
+    for attr in ('self_info', 'info'):
+        if not hasattr(type(bot), attr) and attr not in vars(bot):
+            continue
+        try:
+            payload = getattr(bot, attr)
+        except Exception:
+            continue
+        if isinstance(payload, dict):
+            info['name'] = str(payload.get('nickname') or payload.get('name') or '')
+            avatar = payload.get('avatar') or payload.get('head_image')
+            if avatar:
+                info['avatar'] = str(avatar)
+            break
+    return info
+
+
+async def _register_bot(bot, online: bool) -> None:
+    """记录机器人连接/断开：写库、更新热缓存并推送事件。"""
+    store = _get_store()
+    if not store.ready:
+        return
+    info = _bot_info(bot)
+    if not info['self_id']:
+        return
+    try:
+        record = await store.upsert_bot(
+            info['self_id'],
+            adapter=info.get('adapter', ''),
+            name=info.get('name', ''),
+            avatar=info.get('avatar', ''),
+            online=online,
+        )
+    except Exception as e:  # pragma: no cover - 记录失败不影响机器人本身
+        logger.warning(f'BotUI 记录机器人状态失败：{e}')
+        return
+    if _server is not None:
+        _server.publish_bot(record)
+    logger.debug(f'BotUI 机器人 {info["self_id"]} {"上线" if online else "离线"}')
+
+
+@driver.on_bot_connect
+async def _on_bot_connect(bot) -> None:
+    if not cfg.botui_enabled:
+        return
+    await _register_bot(bot, True)
+
+
+@driver.on_bot_disconnect
+async def _on_bot_disconnect(bot) -> None:
+    if not cfg.botui_enabled:
+        return
+    await _register_bot(bot, False)
+
+
+async def _seed_bots() -> None:
+    """启动时把当前已连接的机器人补进记录。
+
+    ``on_bot_connect`` 只在**新**连接时触发；如果插件是热重载、或机器人先
+    连上、WebUI 后启动，那些已经连着的机器人不会再过一次钩子，这里主动扫
+    一遍 ``get_bots()``，保证「连接过的机器人」列表从一开始就是完整的。
+    """
+    import nonebot
+
+    store = _get_store()
+    if not store.ready:
+        return
+    for bot in list(nonebot.get_bots().values()):
+        try:
+            info = _bot_info(bot)
+            if not info['self_id']:
+                continue
+            await store.upsert_bot(
+                info['self_id'],
+                adapter=info.get('adapter', ''),
+                name=info.get('name', ''),
+                avatar=info.get('avatar', ''),
+                online=True,
+            )
+        except Exception as e:  # pragma: no cover - 补录失败不影响启动
+            logger.debug(f'BotUI 补录已连接机器人失败：{e}')
+
+
 def _try_mount() -> bool:
     """挂载 WebUI；``BOTUI_ENABLED=false`` 时永远不挂。"""
     if not cfg.botui_enabled:
@@ -177,6 +278,7 @@ async def _on_startup() -> None:
     server = _get_server()
     api.setup(store, server, _token)
     mounted = _try_mount()
+    await _seed_bots()
     if cfg.botui_allow_remote and not cfg.botui_auth:
         logger.warning(
             'BotUI 已允许非本机访问（BOTUI_ALLOW_REMOTE=true）且未开启令牌鉴权'

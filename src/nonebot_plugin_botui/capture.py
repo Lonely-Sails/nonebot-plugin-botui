@@ -29,7 +29,9 @@ from .models import (
     MessageRecord,
     now_ts,
     chat_key,
+    self_id_of,
     describe_segments,
+    split_chat_key_parts,
 )
 from .segments import to_segments, extract_text, to_segments_async
 
@@ -251,14 +253,15 @@ def _fallback_record(bot: Bot, event: Event) -> MessageRecord | None:
         adapter = bot.adapter.get_name()
     except Exception:
         adapter = ''
+    self_id = str(getattr(bot, 'self_id', '') or '')
     return MessageRecord(
-        chat_key=chat_key(kind, chat_id),
+        chat_key=chat_key(kind, chat_id, self_id),
         chat_kind=kind,
         chat_id=chat_id,
         direction=DIR_IN,
         ts=now_ts(),
         adapter=adapter,
-        self_id=str(getattr(bot, 'self_id', '') or ''),
+        self_id=self_id,
         chat_name=name,
         user_id=user_id,
         user_name='',
@@ -292,7 +295,7 @@ async def resolve_at_name(bot: Bot, key: str, user_id: str) -> str:
         return _at_names[cache_key]
     name = ''
     try:
-        kind, chat_id = key.split('_', 1)
+        _, kind, chat_id = split_chat_key_parts(key)
         if kind == KIND_GROUP:
             info = await asyncio.wait_for(
                 bot.call_api(
@@ -322,7 +325,9 @@ def register_hooks() -> None:
     Bot.on_called_api(_on_called_api)
 
 
-def _extract_target(api: str, data: dict[str, Any]) -> tuple[str, str] | None:
+def _extract_target(
+    api: str, data: dict[str, Any], self_id: str
+) -> tuple[str, str] | None:
     """从调用参数里推断发送目标，返回 (会话key, 目标id)；认不出就返回 None。
 
     各适配器的参数形状差别很大，这里只认明确表示会话的字段。**不要**去猜
@@ -335,11 +340,11 @@ def _extract_target(api: str, data: dict[str, Any]) -> tuple[str, str] | None:
     channel_id = data.get('channel_id') or data.get('guild_id')
 
     if group_id not in (None, ''):
-        return chat_key(KIND_GROUP, str(group_id)), str(group_id)
+        return chat_key(KIND_GROUP, str(group_id), self_id), str(group_id)
     if channel_id not in (None, ''):
-        return chat_key(KIND_GROUP, str(channel_id)), str(channel_id)
+        return chat_key(KIND_GROUP, str(channel_id), self_id), str(channel_id)
     if user_id not in (None, ''):
-        return chat_key(KIND_PRIVATE, str(user_id)), str(user_id)
+        return chat_key(KIND_PRIVATE, str(user_id), self_id), str(user_id)
     return None
 
 
@@ -358,21 +363,23 @@ async def _on_calling_api(bot: Bot, api: str, data: dict[str, Any]) -> None:
     if not _enabled_for(adapter):
         return
     try:
-        target = _extract_target(api, data)
+        self_id = str(getattr(bot, 'self_id', '') or '')
+        target = _extract_target(api, data, self_id)
         if target is None:
             logger.debug(f'BotUI: cannot infer target for api {api}, skip')
             return
         key, target_id = target
+        _, kind, _ = split_chat_key_parts(key)
         record = MessageRecord(
             chat_key=key,
-            chat_kind=KIND_GROUP if key.startswith(KIND_GROUP) else KIND_PRIVATE,
+            chat_kind=kind,
             chat_id=target_id,
             direction=DIR_OUT,
             ts=now_ts(),
             adapter=adapter,
-            self_id=str(getattr(bot, 'self_id', '') or ''),
-            user_id=str(getattr(bot, 'self_id', '') or ''),
-            user_name=NICKNAME or str(getattr(bot, 'self_id', '') or ''),
+            self_id=self_id,
+            user_id=self_id,
+            user_name=NICKNAME or self_id,
             is_self=True,
             recallable=True,
             api=api,
@@ -518,26 +525,26 @@ def build_outgoing(
     scope: str = '',
 ) -> MessageRecord:
     """根据 WebUI 的发送请求构造一条“发出”记录"""
-    from .models import chat_key as make_key
-
     kind = chat.kind or (
-        KIND_GROUP if chat.key.startswith(KIND_GROUP) else KIND_PRIVATE
+        KIND_GROUP if split_chat_key_parts(chat.key)[1] == KIND_GROUP else KIND_PRIVATE
     )
-    name = NICKNAME or self_id or 'BOT'
+    bot_id = self_id or chat.self_id or self_id_of(chat.key)
+    resolved_key = chat.key or chat_key(kind, chat.chat_id, bot_id)
+    name = NICKNAME or bot_id or 'BOT'
     return MessageRecord(
-        chat_key=chat.key or make_key(kind, chat.chat_id),
+        chat_key=resolved_key,
         chat_kind=kind,
         chat_id=chat.chat_id,
         direction=DIR_OUT,
         ts=now_ts(),
         adapter=adapter or chat.adapter,
         scope=scope or chat.scope,
-        self_id=self_id or chat.self_id,
+        self_id=bot_id,
         parent_id=chat.parent_id,
         chat_name=chat.name,
         chat_avatar=chat.avatar,
         member_count=chat.member_count,
-        user_id=self_id or chat.self_id,
+        user_id=bot_id,
         user_name=name,
         is_self=True,
         text=text,

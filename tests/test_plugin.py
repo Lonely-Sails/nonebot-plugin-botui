@@ -34,7 +34,8 @@ MEMBER_INFO = {
 def _chat_key(kind: str, chat_id: str) -> str:
     from src.nonebot_plugin_botui.models import chat_key
 
-    return chat_key(kind, chat_id)
+    # 会话 key 带上机器人 ID，与采集时写入的格式保持一致
+    return chat_key(kind, chat_id, BOT_ID)
 
 
 def _mock_uninfo(ctx, user_id: int = USER_ID):
@@ -430,3 +431,66 @@ async def test_plain_text_does_not_trigger_anything(app: App, botui):
     added = [m for m in await store.messages(key, limit=500) if m.row_id > baseline]
     assert [m.text for m in added] == list(texts), '消息本身仍然应该被采集'
     assert all(m.direction == 'in' for m in added), '这些话不该再触发任何回复'
+
+
+# ── 机器人展示信息 ──────────────────────────────────────────────────────
+def test_bot_info_never_returns_partial(botui):
+    """机器人名字绝不能是 ``functools.partial(...)`` 那串。
+
+    NoneBot 的基类 ``Bot`` 重写了 ``__getattr__``：任何**不存在**的属性都会被
+    当成 API 调用返回 ``partial(bot.call_api, name)``。早期 ``_bot_info`` 用
+    ``getattr(bot, 'nickname', '')`` 兜底取昵称，默认值形同虚设，界面上就出现
+    了 ``functools.partial(<bound method Bot.call_api of Bot(...)>, 'nickname')``。
+    """
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot
+    from nonebot.adapters.onebot.v11 import Adapter as OnebotV11Adapter
+
+    adapter = nonebot.get_adapter(OnebotV11Adapter)
+    bot = Bot(adapter, self_id=BOT_ID)
+
+    info = botui._bot_info(bot)
+    assert info['self_id'] == BOT_ID
+    assert 'functools.partial' not in str(info.get('name', ''))
+    assert 'call_api' not in str(info.get('name', ''))
+    # 取不到真实昵称时宁可为空，交给前端用 self_id 顶替
+    assert info.get('name', '') == ''
+
+
+def test_bot_info_reads_self_info_dict(botui):
+    """适配器把昵称挂在 ``bot.self_info`` 上时要能读到。"""
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot
+    from nonebot.adapters.onebot.v11 import Adapter as OnebotV11Adapter
+
+    adapter = nonebot.get_adapter(OnebotV11Adapter)
+
+    class SelfInfoBot(Bot):
+        def __init__(self, adapter, self_id):
+            super().__init__(adapter, self_id)
+            self.self_info = {'nickname': '小可爱', 'avatar': 'http://x/y.png'}
+
+    info = botui._bot_info(SelfInfoBot(adapter, BOT_ID))
+    assert info['name'] == '小可爱'
+    assert info['avatar'] == 'http://x/y.png'
+
+
+def test_bot_info_never_calls_api(botui):
+    """``_bot_info`` 是纯属性读取，不该主动调适配器接口。
+
+    连接钩子里多发一次 API 调用会打乱调用方的调用序列（例如 nonebug 测试里
+    ``should_call_api`` 的期望顺序），所以这里用「一调就炸」的 bot 钉死行为。
+    """
+    import nonebot
+    from nonebot.adapters.onebot.v11 import Bot
+    from nonebot.adapters.onebot.v11 import Adapter as OnebotV11Adapter
+
+    adapter = nonebot.get_adapter(OnebotV11Adapter)
+
+    class BoomBot(Bot):
+        async def call_api(self, api, **kwargs):
+            raise AssertionError('不该调用适配器接口')
+
+    info = botui._bot_info(BoomBot(adapter, BOT_ID))
+    assert info['self_id'] == BOT_ID
+    assert info.get('name', '') == ''

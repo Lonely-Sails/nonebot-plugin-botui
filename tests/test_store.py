@@ -17,9 +17,14 @@ if TYPE_CHECKING:
 
 
 def _record(key: str, text: str, direction: str = 'in', ts: float | None = None):
-    from nonebot_plugin_botui.models import DIR_IN, DIR_OUT, MessageRecord
+    from nonebot_plugin_botui.models import (
+        DIR_IN,
+        DIR_OUT,
+        MessageRecord,
+        split_chat_key_parts,
+    )
 
-    kind, chat_id = key.split('_', 1)
+    _, kind, chat_id = split_chat_key_parts(key)
     return MessageRecord(
         chat_key=key,
         chat_kind=kind,
@@ -41,7 +46,8 @@ def _record(key: str, text: str, direction: str = 'in', ts: float | None = None)
 def _chat_key(kind: str, chat_id: str) -> str:
     from nonebot_plugin_botui.models import chat_key
 
-    return chat_key(kind, chat_id)
+    # 会话 key 现在带上机器人 ID：同一平台多个机器人各自一份会话
+    return chat_key(kind, chat_id, '12345678')
 
 
 def _new_store(path: Path, **overrides):
