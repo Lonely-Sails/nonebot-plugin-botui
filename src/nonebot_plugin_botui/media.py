@@ -18,6 +18,7 @@ import asyncio
 import ipaddress
 import mimetypes
 from typing import Any
+from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 from collections.abc import AsyncIterator
 
@@ -287,6 +288,60 @@ async def stream(
         resp = await _open(client, url, headers=headers)
         async for chunk in resp.aiter_bytes(CHUNK_SIZE):
             yield chunk
+
+
+class TooLarge(Exception):
+    """下载的内容超过了允许的体积（只用来中断缓存下载）"""
+
+
+async def download(
+    url: str,
+    dest: Path,
+    *,
+    max_bytes: int = 0,
+    timeout: float | None = None,
+) -> tuple[int, str]:
+    """把远程资源流式写入本地文件，返回 ``(字节数, content-type)``。
+
+    与 :func:`stream` 的区别是「边下边落盘」：预缓存媒体时不该先把整个文件读进
+    内存，尤其是视频。超过 ``max_bytes`` 时中断下载并抛 :class:`TooLarge`
+    （调用方负责删掉半截的临时文件）；目标地址不允许时抛 :class:`Blocked`。
+    """
+    dest = Path(dest)
+    limit = int(max_bytes)
+    client = (
+        _client()
+        if timeout is None
+        else httpx.AsyncClient(
+            timeout=httpx.Timeout(timeout, connect=min(5.0, timeout)),
+            follow_redirects=False,
+        )
+    )
+    written = 0
+    try:
+        async with client:
+            resp = await _open(client, url)
+            ctype = (resp.headers.get('content-type') or '').split(';')[0].strip()
+            declared = resp.headers.get('content-length')
+            if limit > 0 and declared and declared.isdigit() and int(declared) > limit:
+                raise TooLarge(f'资源过大（{int(declared)} 字节）')
+            # 这里就地把下载内容写进本地文件：调用方（预缓存）本来就是后台任务，
+            # 而每块只有 64 KB，比起「每块都切一次线程」的开销这样更划算。
+            handle = dest.open('wb')  # noqa: ASYNC230
+            try:
+                async for chunk in resp.aiter_bytes(CHUNK_SIZE):
+                    written += len(chunk)
+                    if limit > 0 and written > limit:
+                        raise TooLarge(f'资源过大（>{limit} 字节）')
+                    handle.write(chunk)
+            finally:
+                handle.close()
+    except Exception:
+        dest.unlink(missing_ok=True)
+        raise
+    if not ctype:
+        ctype = mimetypes.guess_type(url)[0] or 'application/octet-stream'
+    return written, ctype
 
 
 def is_textual(content_type: str, name: str = '') -> bool:

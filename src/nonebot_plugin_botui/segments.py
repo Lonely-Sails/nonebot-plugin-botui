@@ -12,6 +12,9 @@ MAX_RAW = 2000
 # 单条合并转发最多展开的节点数（防止恶意超长转发把响应撑爆）
 MAX_FORWARD_NODES = 200
 
+#: 值得缓存到本地的段类型（见 cacheable_segments）
+CACHEABLE_TYPES = frozenset({'image', 'file', 'voice', 'audio', 'video'})
+
 # 常见的卡片类原始段类型
 _HYPER_TYPES = {'json', 'xml'}
 
@@ -855,4 +858,31 @@ def at_targets(segments: list[dict[str, Any]]) -> list[str]:
         target = str(seg.get('target') or '')
         if target and target != 'all' and ':' not in target:
             out.append(target)
+    return out
+
+
+def cacheable_segments(
+    segments: list[dict[str, Any]], limit: int = 0
+) -> list[dict[str, Any]]:
+    """挑出值得缓存到本地的段（图片 / 文件 / 语音 / 音频 / 视频）。
+
+    只认 **http(s) 直链**：``base64://`` / ``file://`` 这类本地已有的内容不必
+    再复制一份，而 ``file://`` 只在机器人本机有效、对 WebUI 也没意义。
+
+    ``limit > 0`` 时按顺序最多返回 ``limit`` 个 —— 媒体直链普遍只有几分钟的
+    有效期，收到消息的那一刻就该把它们抓下来，但一条消息里塞几十个文件时
+    也不该让采集任务跑上几分钟。
+    """
+    out: list[dict[str, Any]] = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        if seg.get('type') not in CACHEABLE_TYPES:
+            continue
+        url = str(seg.get('url') or '').strip()
+        if not url.startswith(('http://', 'https://')):
+            continue
+        out.append(seg)
+        if limit > 0 and len(out) >= limit:
+            break
     return out

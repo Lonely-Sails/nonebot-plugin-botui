@@ -27,7 +27,7 @@ require('nonebot_plugin_apscheduler')
 
 from nonebot_plugin_apscheduler import scheduler
 
-from .paths import DB_FILE, TOKEN_FILE, UPLOAD_DIR
+from .paths import DB_FILE, TOKEN_FILE, UPLOAD_DIR, FILE_CACHE_DIR
 from .store import MessageStore
 from .webui import WebUIServer
 from .config import Config
@@ -36,6 +36,7 @@ from .models import MessageRecord
 from .capture import setup as setup_capture
 from .capture import store_ref, register_hooks
 from .uploads import UploadStore
+from .filecache import FileCache
 
 __plugin_meta__ = PluginMetadata(
     name='BotUI 控制台',
@@ -61,6 +62,7 @@ driver = get_driver()
 _store: MessageStore | None = None
 _server: WebUIServer | None = None
 _uploads: UploadStore | None = None
+_cache: FileCache | None = None
 _token: str = ''
 _hooks_ready = False
 
@@ -96,7 +98,7 @@ def _get_store() -> MessageStore:
         _store.on_insert = _on_record_inserted
         if not _hooks_ready:
             # 采集钩子只注册一次（Bot.on_calling_api 会累加回调，重复注册会记多条）
-            setup_capture(_store, cfg)
+            setup_capture(_store, cfg, _get_cache())
             register_hooks()
             _hooks_ready = True
     return _store
@@ -107,6 +109,21 @@ def _get_server() -> WebUIServer:
     if _server is None:
         _server = WebUIServer()
     return _server
+
+
+def _get_cache() -> FileCache:
+    """收到的图片/文件缓存（链接失效后仍能打开，见 filecache.py）。"""
+    global _cache
+    if _cache is None:
+        _cache = FileCache(
+            FILE_CACHE_DIR,
+            max_bytes=cfg.botui_cache_max_bytes if cfg.botui_cache_enabled else 0,
+            max_files=cfg.botui_cache_max_files if cfg.botui_cache_enabled else 0,
+            ttl=cfg.botui_cache_ttl,
+            retention=cfg.botui_cache_retention,
+            file_max_bytes=cfg.botui_cache_file_max_bytes,
+        )
+    return _cache
 
 
 def _get_uploads() -> UploadStore:
@@ -254,6 +271,11 @@ async def _cleanup_job() -> None:
         return
     if dropped:
         logger.info(f'BotUI 已清理 {dropped} 个过期上传附件')
+    # 媒体缓存也在这里回收（未被引用的按 ttl，被引用的按保留期）
+    try:
+        await asyncio.to_thread(_get_cache().cleanup)
+    except Exception as e:  # pragma: no cover - 清理失败不影响机器人
+        logger.debug(f'BotUI 清理媒体缓存失败：{e}')
 
 
 def _log_banner(mounted: bool, store: MessageStore) -> None:
@@ -298,7 +320,7 @@ async def _on_startup() -> None:
     from . import api
 
     server = _get_server()
-    api.setup(store, server, _token, _get_uploads())
+    api.setup(store, server, _token, _get_uploads(), _get_cache())
     mounted = _try_mount()
     await _seed_bots()
     if cfg.botui_allow_remote and not cfg.botui_auth:

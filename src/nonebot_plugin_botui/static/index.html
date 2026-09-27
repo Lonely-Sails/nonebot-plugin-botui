@@ -69,6 +69,11 @@
           <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M20 12a8 8 0 1 1-2.6-5.9"/><path d="M20.2 4.4v4.2H16"/></svg>
         </button>
 
+        <!-- 设置：缓存管理（本地缓存占用 / 清理），入口在右上角 -->
+        <button class="icon-btn" id="settingsBtn" type="button" title="设置" aria-label="设置" aria-haspopup="dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3.2"/><path d="M12 2.8v2.4M12 18.8v2.4M2.8 12h2.4M18.8 12h2.4M5.5 5.5l1.7 1.7M16.8 16.8l1.7 1.7M18.5 5.5l-1.7 1.7M7.2 16.8l-1.7 1.7"/></svg>
+        </button>
+
         <!-- 机器人切换器：列出所有连接过的机器人，在线的标「在线」，会话按机器人区分 -->
         <div class="bot-switch" id="botSwitch">
           <button class="bot-btn" id="botBtn" type="button" aria-haspopup="true" aria-expanded="false" title="切换机器人">
@@ -134,6 +139,36 @@
 
   <!-- 消息右键菜单 -->
   <div class="ctx-menu" id="ctxMenu" hidden role="menu"></div>
+
+  <!-- 设置面板：目前只有本地缓存管理，后续设置项继续往里加 -->
+  <div class="settings" id="settings" hidden role="dialog" aria-modal="true" aria-labelledby="settingsTitle">
+    <div class="settings-card">
+      <header class="settings-head">
+        <h2 class="settings-title" id="settingsTitle">设置</h2>
+        <button class="file-action" id="settingsClose" type="button">关闭</button>
+      </header>
+      <div class="settings-body">
+        <section class="settings-section">
+          <div class="settings-section-head">
+            <h3 class="settings-section-title">本地缓存</h3>
+            <span class="settings-badge" id="cacheState">—</span>
+          </div>
+          <p class="settings-desc">
+            机器人收到的图片与文件会自动下载到本地，之后即使原链接失效也能查看。
+            未被聊天记录引用的资源会按保留时间自动回收。
+          </p>
+          <div class="cache-stats" id="cacheStats"></div>
+          <div class="cache-actions">
+            <button class="settings-btn" id="cacheRefresh" type="button">刷新</button>
+            <button class="settings-btn" id="cacheClearOrphans" type="button">清理未引用</button>
+            <button class="settings-btn" id="cacheClearImages" type="button">清理图片</button>
+            <button class="settings-btn" id="cacheClearFiles" type="button">清理文件</button>
+            <button class="settings-btn danger" id="cacheClearAll" type="button">清空缓存</button>
+          </div>
+        </section>
+      </div>
+    </div>
+  </div>
 
   <!-- @ 成员选择菜单：列出该会话记录到过的成员，供点选 -->
   <div class="at-menu" id="atMenu" hidden role="menu" tabindex="-1" aria-label="选择要提及的成员"></div>

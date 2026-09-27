@@ -48,6 +48,10 @@ const state = {
   bots: [],                 // 连接过的机器人（含在线状态）
   botId: '',                // 当前选中的机器人 self_id（会话按它区分）
   botMenuOpen: false,       // 机器人切换菜单是否展开
+  settingsOpen: false,      // 设置面板是否展开
+  cache: null,              // /api/cache 拿到的缓存概况
+  cacheBusy: false,         // 缓存操作进行中（按钮置灰防连点）
+  settingsSeq: 0,           // 缓存统计请求序号，丢弃过期响应
 
   chats: [],                // 会话列表（按时间倒序）
   chatMap: new Map(),       // key -> 会话
@@ -117,6 +121,16 @@ const el = {
   connMeta: $('connMeta'),
   backBtn: $('backBtn'),
   reloadBtn: $('reloadBtn'),
+  settingsBtn: $('settingsBtn'),
+  settings: $('settings'),
+  settingsClose: $('settingsClose'),
+  cacheState: $('cacheState'),
+  cacheStats: $('cacheStats'),
+  cacheRefresh: $('cacheRefresh'),
+  cacheClearOrphans: $('cacheClearOrphans'),
+  cacheClearImages: $('cacheClearImages'),
+  cacheClearFiles: $('cacheClearFiles'),
+  cacheClearAll: $('cacheClearAll'),
   botSwitch: $('botSwitch'),
   botBtn: $('botBtn'),
   botDot: $('botDot'),
@@ -918,6 +932,158 @@ async function loadBots() {
     if (data && Array.isArray(data.bots)) mergeBots(data.bots);
   } catch (err) {
     // 拉不到就保持现有列表，等下一次事件或重连再刷新
+  }
+}
+
+/* ====================== 4c. 设置面板（缓存管理） ======================
+   机器人收到的图片/文件会在服务端落盘缓存（见后端 filecache.py），右上角
+   的入口用来查看占用并清理。缓存清理是不可撤销的删除动作，所有操作都要
+   用户显式点按钮，不做自动清理之外的任何隐式删除。 */
+
+function cacheEnabled() {
+  return !!(state.meta && state.meta.cache_enabled);
+}
+
+function openSettings() {
+  if (state.settingsOpen) return;
+  state.settingsOpen = true;
+  el.settings.hidden = false;
+  loadCache();
+}
+
+function closeSettings() {
+  if (!state.settingsOpen) return;
+  state.settingsOpen = false;
+  el.settings.hidden = true;
+  // 关面板时把「待确认」状态的按钮还原，避免下次打开还停在那里
+  window.clearTimeout(cacheConfirmTimer);
+  disarmCacheConfirm(el.cacheClearAll);
+}
+
+function toggleSettings() {
+  if (state.settingsOpen) closeSettings();
+  else openSettings();
+}
+
+function cacheStat(label, value, sub) {
+  const box = h('div', 'cache-stat');
+  box.appendChild(h('div', 'cache-stat-label', label));
+  box.appendChild(h('div', 'cache-stat-value', value));
+  if (sub) box.appendChild(h('div', 'cache-stat-sub', sub));
+  return box;
+}
+
+function renderCacheStats() {
+  const data = state.cache;
+  const box = el.cacheStats;
+  box.textContent = '';
+
+  if (!cacheEnabled()) {
+    el.cacheState.textContent = '未开启';
+    el.cacheState.className = 'settings-badge';
+    box.appendChild(cacheStat('状态', '缓存已关闭'));
+    setCacheButtons(false);
+    return;
+  }
+  el.cacheState.textContent = '已开启';
+  el.cacheState.className = 'settings-badge on';
+
+  if (!data) {
+    box.appendChild(cacheStat('状态', '读取中…'));
+    setCacheButtons(false);
+    return;
+  }
+
+  const limit = Number(data.max_bytes) > 0
+    ? '上限 ' + formatBytes(Number(data.max_bytes))
+    : (Number(data.max_files) > 0 ? '上限 ' + Number(data.max_files) + ' 个' : '不限制');
+  box.appendChild(cacheStat('占用', formatBytes(Number(data.bytes)) || '0 B', limit));
+  box.appendChild(cacheStat('资源数', Number(data.files) + ' 个',
+    '被引用 ' + Number(data.referenced || 0) + ' 个'));
+  const images = data.images || { files: 0, bytes: 0 };
+  box.appendChild(cacheStat('图片', images.files + ' 个', formatBytes(images.bytes) || '0 B'));
+  const others = data.others || { files: 0, bytes: 0 };
+  box.appendChild(cacheStat('文件', others.files + ' 个', formatBytes(others.bytes) || '0 B'));
+  box.appendChild(cacheStat('本次运行', '命中 ' + Number(data.hits || 0) + ' / 新增 ' + Number(data.fetched || 0),
+    '未命中 ' + Number(data.misses || 0)));
+  box.appendChild(cacheStat('目录', hasText(data.dir) ? String(data.dir) : '—'));
+
+  setCacheButtons(Number(data.files) > 0);
+}
+
+function setCacheButtons(enabled) {
+  const busy = state.cacheBusy || !cacheEnabled();
+  [el.cacheRefresh, el.cacheClearOrphans, el.cacheClearImages,
+    el.cacheClearFiles, el.cacheClearAll].forEach((btn) => {
+    if (!btn) return;
+    btn.disabled = busy || (!enabled && btn !== el.cacheRefresh);
+  });
+}
+
+async function loadCache() {
+  if (!cacheEnabled()) {
+    state.cache = null;
+    renderCacheStats();
+    return;
+  }
+  const seq = ++state.settingsSeq;
+  try {
+    const data = await api('/cache');
+    if (seq !== state.settingsSeq) return;
+    state.cache = data && data.cache ? data.cache : null;
+  } catch (err) {
+    if (seq !== state.settingsSeq) return;
+    state.cache = null;
+    if (!err || err.status !== 401) {
+      toast(err && err.message ? err.message : '读取缓存信息失败', true);
+    }
+  }
+  renderCacheStats();
+}
+
+// 破坏性操作（清空全部）不弹 window.confirm：这个项目里一个原生弹窗都没用过，
+// 突兀的浏览器弹窗体验割裂。改成「点一次变确认、再点才执行」，3 秒不点自动还原。
+let cacheConfirmTimer = 0;
+
+function armCacheConfirm(btn, text) {
+  if (!btn) return;
+  if (btn.dataset.armed === '1') return true;
+  btn.dataset.armed = '1';
+  btn.dataset.label = btn.textContent;
+  btn.textContent = text || '确认？';
+  btn.classList.add('armed');
+  window.clearTimeout(cacheConfirmTimer);
+  cacheConfirmTimer = window.setTimeout(() => disarmCacheConfirm(btn), 3000);
+  return false;
+}
+
+function disarmCacheConfirm(btn) {
+  if (!btn) return;
+  btn.dataset.armed = '';
+  btn.classList.remove('armed');
+  if (btn.dataset.label) btn.textContent = btn.dataset.label;
+}
+
+async function clearCache(mode, label, btn) {
+  if (state.cacheBusy || !cacheEnabled()) return;
+  // 清空全部不可撤销，要用户再点一次确认
+  if (mode === 'all' && !armCacheConfirm(btn, '确认清空？')) return;
+  disarmCacheConfirm(btn);
+  state.cacheBusy = true;
+  setCacheButtons(true);
+  try {
+    const data = await api('/cache', { method: 'POST', body: { action: 'clear', mode: mode } });
+    state.cache = data && data.cache ? data.cache : null;
+    const removed = Number(data && data.removed) || 0;
+    const freed = formatBytes(Number(data && data.bytes) || 0);
+    toast('已' + (label || '清理') + ' ' + removed + ' 个' + (freed ? '（' + freed + '）' : ''));
+  } catch (err) {
+    if (!err || err.status !== 401) {
+      toast(err && err.message ? err.message : '清理缓存失败', true);
+    }
+  } finally {
+    state.cacheBusy = false;
+    renderCacheStats();
   }
 }
 
@@ -2980,6 +3146,19 @@ function bindEvents() {
 
   el.reloadBtn.addEventListener('click', () => { reloadCurrent(); });
 
+  // 设置面板：右上角齿轮开合，面板内的缓存按钮各管一个清理模式
+  el.settingsBtn.addEventListener('click', toggleSettings);
+  el.settingsClose.addEventListener('click', closeSettings);
+  el.settings.addEventListener('click', (ev) => {
+    // 点卡片外的遮罩关闭（和文件预览弹窗一致的手感）
+    if (ev.target === el.settings) closeSettings();
+  });
+  el.cacheRefresh.addEventListener('click', () => { loadCache(); });
+  el.cacheClearOrphans.addEventListener('click', (ev) => clearCache('orphans', '清理未引用缓存', ev.currentTarget));
+  el.cacheClearImages.addEventListener('click', (ev) => clearCache('image', '清理图片缓存', ev.currentTarget));
+  el.cacheClearFiles.addEventListener('click', (ev) => clearCache('file', '清理文件缓存', ev.currentTarget));
+  el.cacheClearAll.addEventListener('click', (ev) => clearCache('all', '清空缓存', ev.currentTarget));
+
   // 机器人切换器：点按钮开合菜单，点菜单项切换
   el.botBtn.addEventListener('click', (ev) => {
     ev.stopPropagation();
@@ -3101,6 +3280,7 @@ function bindEvents() {
   // Esc / 点击空白关闭浮层
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
+    if (!el.settings.hidden) { closeSettings(); return; }
     if (!el.fileViewer.hidden) { closeFileViewer(); return; }
     if (!el.lightbox.hidden) { closeLightbox(); return; }
     if (!el.atMenu.hidden) { closeAtMenu(); return; }
@@ -3118,7 +3298,6 @@ function bindEvents() {
   });
   window.addEventListener('resize', () => { closeAtMenu(); closeCtxMenu(); closeBotMenu(); });
   window.addEventListener('blur', () => { closeCtxMenu(); closeBotMenu(); });
-
   // 拖拽文件到窗口任意位置：显示提示层，松手后上传。
   // dragenter/dragleave 会在子元素间反复触发，所以用一个计数器判断是否仍在窗口内。
   let dragDepth = 0;

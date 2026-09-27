@@ -37,6 +37,13 @@ if _WORKER:
 os.environ['LOCALSTORE_PLUGIN_DATA_DIR'] = json.dumps(
     {'nonebot_plugin_botui': DATA_DIR}
 )
+# 本地缓存同样重定向，别把测试下载的字节写进开发机上真实的缓存目录。
+# 放在 DATA_DIR 之下：after_nonebot_init 会 rmtree(DATA_DIR)，顺带把上次跑剩的
+# 缓存清干净，不用再单独维护一份清理逻辑。
+CACHE_DIR = f'{DATA_DIR}/cache'
+os.environ['LOCALSTORE_PLUGIN_CACHE_DIR'] = json.dumps(
+    {'nonebot_plugin_botui': CACHE_DIR}
+)
 os.environ.setdefault('BOTUI_AUTH', 'true')
 os.environ.setdefault('BOTUI_TOKEN', 'test-token')
 os.environ.setdefault('BOTUI_SEND_INTERVAL', '0')

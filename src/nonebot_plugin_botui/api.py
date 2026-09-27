@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import json
 import time
 import asyncio
@@ -30,11 +31,13 @@ from .models import (
 )
 from .capture import resume_sent, suppress_sent, build_outgoing
 from .segments import guess_mime, resolve_file_name
+from .filecache import ID_PATTERN, FileCache
 
 if TYPE_CHECKING:
     from .store import MessageStore
     from .webui import WebUIServer
     from .uploads import UploadStore, UploadRecord
+    from .filecache import CachedFile
 
 VERSION = '0.1.0'
 
@@ -45,11 +48,15 @@ WS_HEARTBEAT = 25.0
 #: 一次发送最多带几个附件（多了适配器多半也发不出去，还会把请求撑得很大）
 MAX_UPLOADS_PER_MESSAGE = 10
 
+#: 清理缓存时允许的模式（前端设置面板的按钮各对应一个）
+CACHE_CLEAR_MODES = frozenset({'all', 'orphans', 'image', 'file'})
+
 router = APIRouter()
 
 _store: 'MessageStore | None' = None
 _server: 'WebUIServer | None' = None
 _uploads: 'UploadStore | None' = None
+_cache: FileCache | None = None
 _token: str = ''
 _last_send: dict[str, float] = {}
 _static_dir = Path(__file__).parent / 'static'
@@ -60,16 +67,18 @@ def setup(
     server: 'WebUIServer',
     token: str,
     uploads: 'UploadStore | None' = None,
+    cache: FileCache | None = None,
 ) -> None:
     """注入依赖（由插件在启动时调用一次）。
 
     存储、事件服务、令牌都由这里一次性注入，而不是一半用模块变量、一半塞进
     ``app.state`` —— 两套机制混用会让「谁先谁后」变得难以推断。
 
-    ``uploads`` 是 WebUI 上传附件的存储（见 ``uploads.py``）；不传时按配置
-    创建一个默认实例，方便测试直接调用本模块。
+    ``uploads`` 是 WebUI 上传附件的存储（见 ``uploads.py``）；``cache`` 是
+    收到的媒体/文件缓存（见 ``filecache.py``）。两者不传时按配置各建一个
+    默认实例，方便测试直接调用本模块。
     """
-    global _store, _server, _token, _uploads
+    global _store, _server, _token, _uploads, _cache
     _store = store
     _server = server
     _token = token
@@ -83,6 +92,19 @@ def setup(
             UPLOAD_DIR,
             max_bytes=cfg.botui_upload_max_bytes,
             ttl=cfg.botui_upload_ttl,
+        )
+    if cache is not None:
+        _cache = cache
+    elif _cache is None:
+        from .paths import FILE_CACHE_DIR
+
+        _cache = FileCache(
+            FILE_CACHE_DIR,
+            max_bytes=cfg.botui_cache_max_bytes if cfg.botui_cache_enabled else 0,
+            max_files=cfg.botui_cache_max_files if cfg.botui_cache_enabled else 0,
+            ttl=cfg.botui_cache_ttl,
+            retention=cfg.botui_cache_retention,
+            file_max_bytes=cfg.botui_cache_file_max_bytes,
         )
 
 
@@ -294,6 +316,7 @@ async def get_meta(request: Request) -> dict[str, Any]:
         'file_max_bytes': int(cfg.botui_file_max_bytes),
         'upload_enabled': bool(cfg.botui_upload_enabled and cfg.botui_write_enabled),
         'upload_max_bytes': int(cfg.botui_upload_max_bytes),
+        'cache_enabled': bool(_cache is not None and _cache.enabled),
     }
     # 这些是环境细节：数据库在磁盘上的位置、机器人的 self_id 清单、消息总量。
     # 未通过校验时不返回，避免匿名请求就能摸清部署情况。
@@ -955,6 +978,10 @@ async def get_media(request: Request, u: str = Query(..., min_length=8)) -> Any:
     parts = urlsplit(u)
     if parts.scheme not in ('http', 'https'):
         raise HTTPException(status_code=400, detail='仅支持 http/https 链接')
+    # 本地缓存优先：图片是最先失效的一类资源，命中就不再联网
+    cached = await _local_cached(u)
+    if cached is not None:
+        return _cached_response(cached)
     result = await fetch(u)
     if result is None:
         # 拿不到就退回原链接，前端仍然显示为破图而不是报错
@@ -988,6 +1015,76 @@ async def _resolve_media_url(store: 'MessageStore | None', raw: str) -> str:
                 if candidate.startswith(('http://', 'https://')):
                     return candidate
     return ''
+
+
+async def _local_cached(u: str) -> 'CachedFile | None':
+    """如果这个地址已经有本地缓存副本，返回对应的 :class:`CachedFile`。
+
+    有了它，媒体/文件就再也不用去碰那个随时会失效的原始链接 —— 这正是
+    「缓存」的收益所在。地址既可能是原始链接，也可能是缓存地址本身。
+    """
+    if _cache is None:
+        return None
+    text = str(u or '').strip()
+    if not text:
+        return None
+    return await asyncio.to_thread(_cache.lookup, text)
+
+
+def _cached_response(
+    cached: 'CachedFile', *, download: bool = False, name: str = ''
+) -> Any:
+    """本地缓存副本的响应（与 ``/api/file`` 的对外行为保持一致）。
+
+    统一交给 ``FileResponse``：它自带 Range 支持（音视频拖进度条靠它），
+    自己拼 ``StreamingResponse`` 反而要重写一遍 Range 解析。
+    """
+    filename = resolve_file_name(name or cached.name, cached.source, fallback='file')
+    media = (
+        cached.mime
+        or guess_mime(cached.source or filename)
+        or 'application/octet-stream'
+    )
+    return FileResponse(
+        cached.path,
+        media_type=media,
+        headers={
+            'Cache-Control': 'private, max-age=600',
+            # 响应头不能把「命中了缓存」变成浏览器的缓存键，所以只做一个诊断标记
+            'X-BotUI-Cache': 'hit' if not download else 'hit-download',
+            'Content-Disposition': _content_disposition(
+                'attachment' if download else 'inline', filename
+            ),
+        },
+    )
+
+
+async def _preview_local(cached: 'CachedFile', name: str) -> dict[str, Any]:
+    """用本地缓存副本做文本预览（不联网，因而不受链接失效影响）。"""
+    from .media import MAX_TEXT_BYTES, is_textual, decode_text
+
+    filename = resolve_file_name(name or cached.name, cached.source)
+    if not is_textual(cached.mime, filename):
+        raise HTTPException(status_code=415, detail='该文件不是文本类型，无法在线预览')
+
+    def _read() -> bytes:
+        with cached.path.open('rb') as handle:
+            return handle.read(MAX_TEXT_BYTES)
+
+    data = await asyncio.to_thread(_read)
+    text, truncated = decode_text(data)
+    if len(data) >= MAX_TEXT_BYTES:
+        truncated = True
+    return {
+        'ok': True,
+        'name': filename,
+        'text': text,
+        'truncated': truncated,
+        'content_type': cached.mime or None,
+        'bytes': cached.size,
+        'url': cached.source,
+        'cached': True,
+    }
 
 
 def _content_disposition(disposition: str, filename: str) -> str:
@@ -1027,6 +1124,73 @@ _PASSTHROUGH_HEADERS = (
 )
 
 
+# ── 本地缓存：取回与管理 ────────────────────────────────────────────────
+@router.get('/api/cache')
+async def get_cache(request: Request) -> dict[str, Any]:
+    """缓存概况（设置面板显示占用与命中数）。"""
+    _guard(request)
+    if _cache is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
+    return {'ok': True, 'cache': await asyncio.to_thread(_cache.stats)}
+
+
+@router.post('/api/cache')
+async def post_cache(request: Request) -> dict[str, Any]:
+    """缓存维护：清理（按模式）与重置统计。
+
+    清理是真的删文件，所以走 ``_guard_write`` —— 只读模式下不该动磁盘。
+    """
+    _guard_write(request)
+    if _cache is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = None
+    body = payload if isinstance(payload, dict) else {}
+
+    action = str(body.get('action') or 'clear')
+    if action == 'reset_stats':
+        await asyncio.to_thread(_cache.reset_stats)
+        return {'ok': True, 'cache': await asyncio.to_thread(_cache.stats)}
+    if action != 'clear':
+        raise HTTPException(status_code=400, detail=f'不支持的操作：{action}')
+
+    mode = str(body.get('mode') or 'all')
+    if mode not in CACHE_CLEAR_MODES:
+        raise HTTPException(status_code=400, detail=f'不支持的清理方式：{mode}')
+    result = await asyncio.to_thread(_cache.clear, mode)
+    return {
+        'ok': True,
+        'mode': mode,
+        'removed': int(result.get('removed') or 0),
+        'bytes': int(result.get('bytes') or 0),
+        'cache': await asyncio.to_thread(_cache.stats),
+    }
+
+
+@router.get('/api/cache/{fid}')
+async def get_cached(
+    request: Request,
+    fid: str,
+    download: int = Query(0, ge=0, le=1),
+) -> Any:
+    """按 id 取回本地缓存的媒体/文件（消息段里的地址就指向这里）。
+
+    这个接口不需要 ``store``：缓存本身就是完整副本，即使对应消息早被上限
+    清理掉了，只要资源还在就能打开。
+    """
+    _guard(request)
+    if _cache is None:  # pragma: no cover - setup 一定会注入
+        raise HTTPException(status_code=503, detail='BotUI 缓存尚未就绪')
+    if not fid or not re.fullmatch(ID_PATTERN, fid):
+        raise HTTPException(status_code=404, detail='缓存不存在')
+    record = await asyncio.to_thread(_cache.get, fid)
+    if record is None:
+        raise HTTPException(status_code=404, detail='缓存不存在或已被清理')
+    return _cached_response(record, download=bool(download))
+
+
 @router.get('/api/file')
 async def get_file(
     request: Request,
@@ -1050,6 +1214,12 @@ async def get_file(
 
     _guard(request)
     store = _require_store()
+
+    # 有本地缓存副本就直接回本地文件：既能规避防盗链，也不再受链接过期影响
+    cached = await _local_cached(u)
+    if cached is not None:
+        return _cached_response(cached, download=bool(download), name=name)
+
     url = await _resolve_media_url(store, u)
     if not url:
         raise HTTPException(status_code=400, detail='缺少可用的文件链接')
@@ -1127,6 +1297,12 @@ async def get_preview(
     if not cfg.botui_file_preview:
         raise HTTPException(status_code=403, detail='BotUI 未开启文件在线预览')
     store = _require_store()
+
+    # 本地缓存优先：读到本地副本就干脆不必联网
+    cached = await _local_cached(u)
+    if cached is not None:
+        return await _preview_local(cached, name)
+
     url = await _resolve_media_url(store, u)
     if not url:
         raise HTTPException(status_code=400, detail='缺少可用的文件链接')
