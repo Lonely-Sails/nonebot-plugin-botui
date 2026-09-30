@@ -30,8 +30,9 @@ const ROOT_BASE_PATH = new URL(ROOT_BASE + '/', document.baseURI).pathname.repla
 
 const TOKEN_KEY = 'botui_token';
 const THEME_KEY = 'botui_theme';
-const BOT_KEY = 'botui_bot';   // 当前选中的机器人（会话按机器人区分）
-const CHAT_KEY = 'botui_chat'; // 每个机器人最近打开的会话（{self_id: chat_key}）
+const BOT_KEY = 'botui_bot';       // 当前选中的机器人（会话按机器人区分）
+const CHAT_KEY = 'botui_chat';     // 每个机器人最近打开的会话（{self_id: chat_key}）
+const NOTIFY_KEY = 'botui_notify'; // 网页通知偏好（{enabled, sound}）
 
 const PAGE_LIMIT_FALLBACK = 50;  // 每次拉取消息条数（后端可用 BOTUI_PAGE_SIZE 覆盖）
 const MSG_MAX = 1200;       // 前端保留的最大消息数
@@ -43,8 +44,6 @@ const NEAR_BOTTOM = 80;     // 距底部多少像素内算“贴着底部”
 
 const state = {
   meta: null,               // /meta 结果
-  l: '',                    // 占位（未使用）
-  l: '',                    // 占位（未使用）
   token: '',                // 访问令牌
   gateOpen: false,          // 令牌页是否显示
   gateFrom401: false,       // 令牌页是否由 401 触发
@@ -56,6 +55,8 @@ const state = {
   cache: null,              // /api/cache 拿到的缓存概况
   cacheBusy: false,         // 缓存操作进行中（按钮置灰防连点）
   settingsSeq: 0,           // 缓存统计请求序号，丢弃过期响应
+
+  notify: { enabled: false, sound: true }, // 网页通知偏好（enabled/sound）
 
   chats: [],                // 会话列表（按时间倒序）
   chatMap: new Map(),       // key -> 会话
@@ -69,9 +70,6 @@ const state = {
 
   fileSeq: 0,               // 文件预览请求序号（丢弃过期结果）
   forwardSeq: 0,            // 合并转发展开请求序号
-
-  unread: new Map(),        // 会话 key -> 未读数
-  pending: new Map(),       // 会话 key -> 未读消息摘要
 
   unread: new Map(),        // 会话 key -> 未读数
   pending: new Map(),       // 会话 key -> 未读消息摘要
@@ -135,6 +133,9 @@ const el = {
   cacheClearImages: $('cacheClearImages'),
   cacheClearFiles: $('cacheClearFiles'),
   cacheClearAll: $('cacheClearAll'),
+  notifyToggle: $('notifyToggle'),
+  notifySound: $('notifySound'),
+  notifyState: $('notifyState'),
   botSwitch: $('botSwitch'),
   botBtn: $('botBtn'),
   botDot: $('botDot'),
@@ -959,6 +960,7 @@ function openSettings() {
   if (state.settingsOpen) return;
   state.settingsOpen = true;
   el.settings.hidden = false;
+  renderNotifySettings();
   loadCache();
 }
 
@@ -1099,6 +1101,172 @@ async function clearCache(mode, label, btn) {
     state.cacheBusy = false;
     renderCacheStats();
   }
+}
+
+/* ====================== 4d. 新消息网页通知 ======================
+   浏览器系统通知 + 可选提示音。用户在设置面板里显式开启（开启时会请求授权）。
+   为避免打扰，只在「页面不可见、或不在该会话且窗口失焦」时提醒，自己发的
+   消息（direction === 'out'）永远不提醒。 */
+
+/** 浏览器是否支持 Notification API */
+function notifySupported() {
+  return typeof window.Notification === 'function';
+}
+
+/** 当前授权状态：'granted' / 'denied' / 'default' / 'unsupported' */
+function notifyPermission() {
+  if (!notifySupported()) return 'unsupported';
+  return Notification.permission || 'default';
+}
+
+function readStoredNotify() {
+  const fallback = { enabled: false, sound: true };
+  try {
+    const raw = localStorage.getItem(NOTIFY_KEY);
+    if (!raw) return fallback;
+    const data = JSON.parse(raw);
+    if (!data || typeof data !== 'object') return fallback;
+    return { enabled: data.enabled === true, sound: data.sound !== false };
+  } catch (err) { return fallback; }
+}
+
+function saveNotify() {
+  try { localStorage.setItem(NOTIFY_KEY, JSON.stringify(state.notify)); } catch (err) { /* 忽略 */ }
+}
+
+function initNotify() {
+  state.notify = readStoredNotify();
+  // 授权被撤销或浏览器不支持时，本地偏好也跟着失效，避免界面上显示「已开启」却不弹
+  if (state.notify.enabled && (notifyPermission() !== 'granted')) state.notify.enabled = false;
+}
+
+function notifyActive() {
+  return !!(state.notify.enabled && notifyPermission() === 'granted');
+}
+
+/** 刷新设置面板里的通知开关与状态徽章 */
+function renderNotifySettings() {
+  if (!el.notifyToggle) return;
+  const perm = notifyPermission();
+  el.notifyToggle.checked = !!state.notify.enabled;
+  el.notifySound.checked = !!state.notify.sound;
+  el.notifyToggle.disabled = perm === 'denied' || perm === 'unsupported';
+  el.notifySound.disabled = !state.notify.enabled;
+
+  if (perm === 'unsupported') {
+    el.notifyState.textContent = '不支持';
+    el.notifyState.className = 'settings-badge';
+  } else if (perm === 'denied') {
+    el.notifyState.textContent = '已拒绝';
+    el.notifyState.className = 'settings-badge';
+  } else if (notifyActive()) {
+    el.notifyState.textContent = '已开启';
+    el.notifyState.className = 'settings-badge on';
+  } else {
+    el.notifyState.textContent = '已关闭';
+    el.notifyState.className = 'settings-badge';
+  }
+}
+
+/** 用户在设置里切换开关：开启时先确保拿到授权 */
+async function setNotifyEnabled(on) {
+  if (!on) {
+    state.notify.enabled = false;
+    saveNotify();
+    renderNotifySettings();
+    return;
+  }
+  if (!notifySupported()) {
+    toast('当前浏览器不支持网页通知', true);
+    renderNotifySettings();
+    return;
+  }
+  let perm = notifyPermission();
+  if (perm === 'default') {
+    try { perm = await Notification.requestPermission(); } catch (err) { perm = notifyPermission(); }
+  }
+  if (perm !== 'granted') {
+    state.notify.enabled = false;
+    toast(perm === 'denied' ? '通知权限已被拒绝，请在浏览器设置里允许' : '未获得通知权限', true);
+    saveNotify();
+    renderNotifySettings();
+    return;
+  }
+  state.notify.enabled = true;
+  saveNotify();
+  renderNotifySettings();
+  toast('已开启新消息通知');
+}
+
+function setNotifySound(on) {
+  state.notify.sound = !!on;
+  saveNotify();
+  renderNotifySettings();
+}
+
+/**
+ * 判断一条新消息是否需要提醒。
+ *
+ * 规则：自己发的、正在看且窗口可见的、浏览器不支持/未授权的都不提醒。
+ * 另外只在「不在该会话，或窗口失焦/页面隐藏」时提醒 —— 换句话说，
+ * 用户正盯着这个会话时不该被打扰。
+ */
+function shouldNotify(msg, isOpen) {
+  if (!notifyActive()) return false;
+  if (!msg || msg.direction === 'out') return false;
+  const blurred = !document.hasFocus() || document.visibilityState !== 'visible';
+  return !isOpen || blurred;
+}
+
+/** 弹出一条系统通知（失败静默，不影响消息流） */
+function pushNotification(msg) {
+  try {
+    const key = String(msg.chat);
+    const chat = state.chatMap.get(key) || (state.current && state.current.key === key ? state.current : null);
+    const title = (chat && hasText(chat.name)) ? String(chat.name)
+      : (hasText(msg.chat_name) ? String(msg.chat_name) : '新消息');
+    const who = hasText(msg.user_name) ? String(msg.user_name) : (hasText(msg.user_id) ? String(msg.user_id) : '');
+    const body = (who ? who + '：' : '') + (previewOf(msg) || '新消息');
+    const n = new Notification(title, { body: shorten(body, 120), tag: key, renotify: true });
+    n.onclick = () => {
+      try { window.focus(); } catch (err) { /* 忽略 */ }
+      if (state.chatMap.has(key)) openChat(key);
+      n.close();
+    };
+  } catch (err) { /* 通知失败（权限被撤销等）不影响主流程 */ }
+}
+
+/* --- 提示音：用 WebAudio 合成两声短提示，免外部音频文件 --- */
+let audioCtx = null;
+function playNotifySound() {
+  if (!state.notify.sound) return;
+  try {
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    if (!Ctx) return;
+    if (!audioCtx) audioCtx = new Ctx();
+    if (audioCtx.state === 'suspended') audioCtx.resume();
+    const now = audioCtx.currentTime;
+    [880, 1174].forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = 'sine';
+      osc.frequency.value = freq;
+      const start = now + i * 0.12;
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(0.12, start + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, start + 0.18);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(start);
+      osc.stop(start + 0.2);
+    });
+  } catch (err) { /* 自动播放被拦截等，静默 */ }
+}
+
+/** 收到新消息时的统一提醒入口（通知 + 提示音） */
+function notifyMessage(msg, isOpen) {
+  if (!shouldNotify(msg, isOpen)) return;
+  pushNotification(msg);
+  playNotifySound();
 }
 
 /* ============================ 5. 会话列表 ============================ */
@@ -3006,6 +3174,8 @@ function handleEvent(ev) {
         updateNewMsgButton();
       }
     }
+    // 网页通知：自己发的、正在看的都不提醒（见 shouldNotify）
+    notifyMessage(msg, isOpen);
     if (ev.chat && typeof ev.chat === 'object' && hasText(ev.chat.key)) mergeChat(ev.chat);
     updateChatList(msg, isOpen);
     return;
@@ -3086,6 +3256,7 @@ async function enterApp() {
 
 async function bootstrap() {
   initTheme();
+  initNotify();
   captureToken();
   renderConnMeta();
 
@@ -3175,6 +3346,10 @@ function bindEvents() {
   el.cacheClearImages.addEventListener('click', (ev) => clearCache('image', '清理图片缓存', ev.currentTarget));
   el.cacheClearFiles.addEventListener('click', (ev) => clearCache('file', '清理文件缓存', ev.currentTarget));
   el.cacheClearAll.addEventListener('click', (ev) => clearCache('all', '清空缓存', ev.currentTarget));
+
+  // 网页通知开关
+  el.notifyToggle.addEventListener('change', () => setNotifyEnabled(el.notifyToggle.checked));
+  el.notifySound.addEventListener('change', () => setNotifySound(el.notifySound.checked));
 
   // 机器人切换器：点按钮开合菜单，点菜单项切换
   el.botBtn.addEventListener('click', (ev) => {

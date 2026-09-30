@@ -150,6 +150,27 @@
       <div class="settings-body">
         <section class="settings-section">
           <div class="settings-section-head">
+            <h3 class="settings-section-title">新消息通知</h3>
+            <span class="settings-badge" id="notifyState">已关闭</span>
+          </div>
+          <p class="settings-desc">
+            收到新消息时弹出系统通知（需浏览器授权）。页面已聚焦在当前会话时不会打扰，
+            自己发出的消息也不会提醒。
+          </p>
+          <label class="settings-switch">
+            <input type="checkbox" id="notifyToggle">
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">开启网页通知</span>
+          </label>
+          <label class="settings-switch">
+            <input type="checkbox" id="notifySound">
+            <span class="switch-track" aria-hidden="true"></span>
+            <span class="switch-text">通知提示音</span>
+          </label>
+        </section>
+
+        <section class="settings-section">
+          <div class="settings-section-head">
             <h3 class="settings-section-title">本地缓存</h3>
             <span class="settings-badge" id="cacheState">—</span>
           </div>
