@@ -23,6 +23,10 @@
 const API_BASE = new URL('api/', document.baseURI).href.replace(/\/$/, '');
 // 插件路由根（/media、/api/file 这些不在 /api 下）
 const ROOT_BASE = new URL('./', document.baseURI).href.replace(/\/$/, '');
+// 插件路由根的**路径**部分（无 host、无末尾斜杠）。消息段里存的是根相对地址
+// （/botui/api/media/<id>），而 ROOT_BASE 是绝对地址，判定「是不是自己的地址」
+// 只能比路径，不能拿绝对 URL 去 indexOf。
+const ROOT_BASE_PATH = new URL(ROOT_BASE + '/', document.baseURI).pathname.replace(/\/$/, '');
 
 const TOKEN_KEY = 'botui_token';
 const THEME_KEY = 'botui_theme';
@@ -195,12 +199,28 @@ function safeUrl(url) {
 /**
  * 判断是不是本插件自己的媒体取回地址（``/api/media/<id>``）。
  *
+ * 消息段里存的是**根相对**地址（``/botui/api/media/<id>``），而 ``ROOT_BASE`` 是
+ * **绝对**地址（``http://host/botui``）—— 直接 ``indexOf`` 永远匹配不上，自己发的
+ * 图片就会被当成外链走无令牌的代理、加载失败。所以把两边都解析成绝对地址、只比
+ * **路径**（忽略 host、协议与查询串）。
+ *
+ * 同时强制**同源**：``//evil.com/botui/api/media/x`` 这类协议相对地址路径能对上，
+ * 却是别人的站点 —— 放行会把令牌一起带过去。只接受根相对地址与同源绝对地址。
+ *
  * 必须收紧到这个白名单 —— 早先写成「任何 ``/api/`` 开头」，结果像
  * ``/api/settings`` 这类接口地址也会被当成图片直链拿去 ``<img src>``。
  */
 function isOwnUrl(url) {
-  if (typeof url !== 'string') return false;
-  return url.indexOf(ROOT_BASE + '/api/media/') === 0;
+  if (typeof url !== 'string' || !url) return false;
+  if (url.slice(0, 2) === '//') return false; // 协议相对 = 别的站点
+  let parsed;
+  try {
+    parsed = new URL(url, document.baseURI);
+  } catch (_) {
+    return false;
+  }
+  if (parsed.origin !== location.origin) return false;
+  return parsed.pathname.indexOf(ROOT_BASE_PATH + '/api/media/') === 0;
 }
 
 /** 接口地址的鉴权参数（<img>/<a>/<video> 带不上自定义请求头，只能走 query） */
@@ -995,6 +1015,9 @@ function renderCacheStats() {
   box.appendChild(cacheStat('图片', images.files + ' 个', formatBytes(images.bytes) || '0 B'));
   const others = data.others || { files: 0, bytes: 0 };
   box.appendChild(cacheStat('文件', others.files + ' 个', formatBytes(others.bytes) || '0 B'));
+  if (Number(data.pending || 0) > 0) {
+    box.appendChild(cacheStat('待发送', Number(data.pending) + ' 个', '选好还没发的临时附件'));
+  }
   box.appendChild(cacheStat('本次运行', '命中 ' + Number(data.hits || 0) + ' / 新增 ' + Number(data.fetched || 0),
     '未命中 ' + Number(data.misses || 0)));
   box.appendChild(cacheStat('目录', hasText(data.dir) ? String(data.dir) : '—'));
@@ -2187,9 +2210,10 @@ function addAt(id, name) {
 }
 
 /* ---------- 待发送附件 ----------
-   选中的图片/文件先上传到服务端（返回 id），发送时只带 id 列表。这么拆是为了
-   能在发送前显示缩略图 / 文件名，也避免把文件字节塞进发送请求体。
-   移除待发送项时顺带把服务端那份也删掉，不占磁盘。 */
+   选中的图片/文件先上传到服务端的**系统临时目录**（返回 id），发送时只带 id
+   列表。这么拆是为了能在发送前显示缩略图 / 文件名，也避免把文件字节塞进发送
+   请求体；发送那一刻服务端才按内容 md5 正式入库。
+   移除待发送项时顺带把临时文件删掉，不占磁盘。 */
 
 function canUpload() {
   const meta = state.meta || {};
@@ -2240,7 +2264,7 @@ function removePendingFile(id) {
   if (keep.length === state.pendingFiles.length) return;
   state.pendingFiles = keep;
   renderPendingFiles();
-  // 服务端那份也删掉；删不掉（已过期）不影响界面，静默即可
+  // 服务端那份临时文件也删掉；删不掉（已过期）不影响界面，静默即可
   api('/media/' + encodeURIComponent(String(id)), { method: 'DELETE' }).catch(() => {});
 }
 

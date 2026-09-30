@@ -173,19 +173,31 @@ def botui(after_nonebot_init: None):
     return module
 
 
-@pytest_asyncio.fixture(loop_scope='session')
-async def media(after_nonebot_init, botui):
+@pytest_asyncio.fixture(loop_scope='session', scope='session')
+async def media_store(after_nonebot_init, botui):
     """把媒体库挂到测试用的消息库连接上（与线上启动钩子做的事一致）。
 
     媒体库是异步的、且必须 ``attach`` 到一条 aiosqlite 连接后才可用，所以这里
-    必须真的启动 store。**每个用例前后各清一次库**：媒体元数据都在同一张
-    ``blobs`` 表里，不同用例（包括自建的实例）共享它，不清就会互相串味。
+    必须真的启动 store。会话级只挂一次；每个用例的清理由下面 function 级的
+    ``media`` 夹具负责（它同样被 ``client`` 间接依赖，保证接口测试也拿到已挂载
+    的媒体库）。
     """
     store = botui._get_store()
     await store.start()
     m = botui._get_media()
     if m.enabled and not m.ready and store.db is not None:
         await m.attach(store.db, store.lock)
+    return m
+
+
+@pytest_asyncio.fixture(loop_scope='session')
+async def media(media_store):
+    """媒体库（每个用例前后各清一次）。
+
+    媒体元数据都在同一张 ``blobs`` 表里，不同用例（包括自建的实例）共享它，
+    不清就会互相串味。
+    """
+    m = media_store
     await m.clear('all')
     m.reset_stats()
     yield m
@@ -193,11 +205,12 @@ async def media(after_nonebot_init, botui):
 
 
 @pytest_asyncio.fixture(loop_scope='session', scope='session')
-async def client(after_nonebot_init):
+async def client(media_store, after_nonebot_init):
     """直接打挂载后的 ASGI 应用，不需要真的监听端口。
 
     用 ``httpx.AsyncClient`` 而不是同步的 ``TestClient``：后者会另开一个事件循环，
-    和 aiosqlite 的连接对不上。
+    和 aiosqlite 的连接对不上。依赖 ``media_store`` 是为了确保上传 / 取回接口
+    用到的媒体库已经挂到同一条连接上。
     """
     from httpx import AsyncClient, ASGITransport
     from nonebot.drivers import ASGIMixin

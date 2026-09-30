@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import asyncio
+import hashlib
 
 import pytest
 import pytest_asyncio
@@ -870,22 +871,24 @@ async def test_upload_then_fetch_and_delete(client: AsyncClient, botui, seeded):
     assert info['name'] == '图片.png'
     assert info['kind'] == 'image'
     assert info['size'] == len(_PNG)
+    # 选好还没发：只是暂存在系统临时目录，媒体库仍是空的
+    assert info['pending'] is True
 
-    got = await client.get(f"/botui/api/media/{info['id']}", headers=HEADERS)
+    got = await client.get(f'/botui/api/media/{info["id"]}', headers=HEADERS)
     assert got.status_code == 200
     assert got.content == _PNG
     assert got.headers['content-type'].startswith('image/png')
 
     # 鉴权同样是硬要求：图片是 <img src> 直接取的，只能靠 query
-    assert (await client.get(f"/botui/api/media/{info['id']}")).status_code == 401
+    assert (await client.get(f'/botui/api/media/{info["id"]}')).status_code == 401
 
     rm = await client.request(
-        'DELETE', f"/botui/api/media/{info['id']}", headers=HEADERS
+        'DELETE', f'/botui/api/media/{info["id"]}', headers=HEADERS
     )
     assert rm.status_code == 200
     assert rm.json()['removed'] is True
     assert (
-        await client.get(f"/botui/api/media/{info['id']}", headers=HEADERS)
+        await client.get(f'/botui/api/media/{info["id"]}', headers=HEADERS)
     ).status_code == 404
 
 
@@ -960,12 +963,15 @@ async def test_send_file_attachment(client: AsyncClient, botui, seeded):
     api_name, payload = calls[-1]
     assert api_name == 'upload_group_file'
     assert payload['name'] == '报告.txt'
-    # 落盘用的是原始文件名（QQ 适配器取磁盘名，叫 blob 对方就收到「未命名」）
+    # 发送用的是原始文件名（QQ 适配器取磁盘名；库里落盘名是内容 md5，
+    # 所以发送时链接出一份带真实文件名的临时副本）
     assert payload['file'].endswith('报告.txt')
 
     file_seg = next(s for s in body['message']['segments'] if s['type'] == 'file')
     assert file_seg['name'] == '报告.txt'
     assert file_seg['size'] == len('报告内容'.encode())
+    # 段里的地址是媒体库地址，且 id 就是内容的 md5
+    assert file_seg['url'].endswith(hashlib.md5('报告内容'.encode()).hexdigest())
     await store.flush()
 
 

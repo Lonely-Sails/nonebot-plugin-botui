@@ -364,6 +364,12 @@ async def _on_startup() -> None:
 
 @driver.on_shutdown
 async def _on_shutdown() -> None:
+    # 待发送的临时附件不属于任何记录，进程结束前主动清掉（别留在系统临时目录）
+    if _media is not None:
+        try:
+            await _media.discard_pending()
+        except Exception as e:  # pragma: no cover - 收尾尽力而为
+            logger.debug(f'BotUI 清理临时附件失败：{e}')
     store = store_ref()
     if store is None:
         return

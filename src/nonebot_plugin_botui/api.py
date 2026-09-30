@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
 import re
 import json
 import time
+import shutil
 import asyncio
 import secrets
+import tempfile
 import ipaddress
 from typing import TYPE_CHECKING, Any
 from pathlib import Path
@@ -31,7 +34,7 @@ from .models import (
 )
 from .capture import resume_sent, suppress_sent, build_outgoing
 from .segments import guess_mime, resolve_file_name
-from .mediastore import ID_PATTERN, MediaStore, url_of
+from .mediastore import MediaStore, url_of, safe_filename
 
 if TYPE_CHECKING:
     from .store import MessageStore
@@ -540,6 +543,10 @@ async def _throttle(key: str) -> None:
 
 
 # ── 附件上传（WebUI 里选图/选文件后以机器人身份发出）────────────────────
+#: 取回 / 删除附件时允许的 id 形状：媒体库里是内容 md5，待发送的是临时 id
+_ANY_ID = re.compile(r'^[A-Za-z0-9_-]{6,80}$')
+
+
 async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
     """从上传请求里取出 ``(字节, 文件名, 类型)``。
 
@@ -556,15 +563,16 @@ async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
 
 @router.post('/api/upload')
 async def post_upload(request: Request) -> dict[str, Any]:
-    """把附件（图片 / 文件）存进媒体库，返回一个可在 ``/api/send`` 里引用的 id。
+    """把待发送附件暂存进系统临时目录，返回一个可在 ``/api/send`` 里引用的 id。
 
-    前端「选附件」这一步就调这里：附件先入库，之后带上 ``uploads: [id]`` 发送。
+    前端「选附件」这一步就调这里：附件先暂存，之后带上 ``uploads: [id]`` 发送。
     这么拆是因为发送前往往要展示预览（图片缩略图、文件名），而发送时才需要
     真实文件；一次性把文件塞进发送请求会让「预览」变得没有意义。
 
-    存进媒体库（而不是单独的临时目录）是刻意的：上传的附件与机器人收到的媒体
-    从此是同一种东西 —— 一个目录、一张表、一个取回地址，发送时也就不必再把它
-    从一处「搬」到另一处。选完没发的附件由 ttl 回收（见 ``mediastore.py``）。
+    刻意**不**在这一步入库：还没发送的东西不该占媒体库配额，也不该被内容去重
+    （同一个文件改名重发是常事）。暂存用 :mod:`tempfile`（系统临时目录），
+    前端点「移除」或超时未发送时直接删掉；直到 ``/api/send`` 那一刻才按内容
+    md5 正式进媒体库（见 ``MediaStore.commit``）。
     """
     _guard_write(request)
     if not cfg.botui_media_enabled:
@@ -583,7 +591,7 @@ async def post_upload(request: Request) -> dict[str, Any]:
                 f'文件过大（{len(data) / 1048576:.1f} MB，上限 {limit // 1048576} MB）'
             ),
         )
-    record = await _media.save(data, name=name, mime=mime)
+    record = await _media.stage(data, name=name, mime=mime)
     if record is None:
         raise HTTPException(status_code=413, detail='附件过大或媒体库未启用')
     return {'ok': True, 'file': record.to_dict()}
@@ -595,18 +603,18 @@ async def get_media(
     fid: str,
     download: int = Query(0, ge=0, le=1),
 ) -> Any:
-    """按 id 取回媒体库里的资源（消息段里的地址就指向这里）。
+    """按 id 取回资源（消息段里的地址就指向这里）。
 
     机器人收到的图片/文件、自己发出的附件都从这里取，因此前端只需要认识一个
-    地址形态。这个接口不需要 ``store``：媒体库本身就是完整副本，即使对应消息
-    早被上限清理掉了，只要资源还在就能打开。
+    地址形态。id 既可能是媒体库里的内容 md5，也可能是**还没发送**的暂存附件
+    （``staging``），两种都能取 —— 后者正是「选完附件立刻看到缩略图」所依赖的。
     """
     _guard(request)
     if _media is None:  # pragma: no cover - setup 一定会注入
         raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
-    if not fid or not re.fullmatch(ID_PATTERN, fid):
+    if not fid or not _ANY_ID.match(fid):
         raise HTTPException(status_code=404, detail='媒体不存在')
-    record = await _media.get(fid)
+    record = await _media.resolve(fid)
     if record is None:
         raise HTTPException(status_code=404, detail='媒体不存在或已被清理')
     return _media_response(record, download=bool(download))
@@ -614,31 +622,67 @@ async def get_media(
 
 @router.delete('/api/media/{fid}')
 async def delete_media(request: Request, fid: str) -> dict[str, Any]:
-    """删除媒体库里的一条资源（前端移除待发送附件时调用）。"""
+    """删除一个资源（前端移除待发送附件时调用）。
+
+    待发送的暂存附件直接删临时文件；已入库的媒体则连同磁盘文件一起删掉。
+    """
     _guard_write(request)
     if _media is None:  # pragma: no cover - setup 一定会注入
         raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
-    if not fid or not re.fullmatch(ID_PATTERN, fid):
+    if not fid or not _ANY_ID.match(fid):
         raise HTTPException(status_code=404, detail='媒体不存在')
     removed = await _media.delete(fid)
     return {'ok': True, 'removed': removed}
 
 
+async def _send_path(record: 'MediaRecord') -> tuple[Path, Path | None]:
+    """取出发送用的磁盘路径，返回 ``(正文路径, 临时副本或 None)``。
+
+    QQ 适配器发本地文件时取的是**磁盘名**，而媒体库里的文件叫内容 md5、暂存
+    附件叫随机临时名，直接发过去对方收到的是「未命名」。所以发送时按真实文件名
+    **硬链接**一份临时副本（同一分区，不占额外磁盘），调用方发完即删。
+    """
+    path = record.path
+    name = safe_filename(record.name)
+    if not name or path.name == name:
+        return path, None
+    directory = Path(tempfile.mkdtemp(prefix='botui-send-'))
+    target = directory / name
+    try:
+        await asyncio.to_thread(os.link, path, target)
+    except OSError:
+        try:
+            await asyncio.to_thread(shutil.copyfile, path, target)
+        except OSError:  # pragma: no cover - 磁盘异常，退回直接发原名
+            shutil.rmtree(directory, ignore_errors=True)
+            return path, None
+    return target, directory
+
+
+async def _cleanup_send(record: 'MediaRecord', directory: Path | None) -> None:
+    """删掉 :func:`_send_path` 临时链接出来的那棵目录。"""
+    if directory is None:
+        return
+    await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
+
+
 async def _upload_segment(
     record: 'MediaRecord',
-) -> tuple[Any, dict[str, Any]]:
-    """把一条媒体资源转成 ``(uniseg 段, 记录里的段字典)``。
+) -> tuple[Any, dict[str, Any], Path | None]:
+    """把一条媒体资源转成 ``(uniseg 段, 记录里的段字典, 发送临时目录)``。
 
     图片按 ``Image`` 发（聊天里直接显示），其余按 ``File`` 发；两者都用文件
     内容/路径而不是 URL：适配器把 ``Image(path=...)`` 转成 ``file://`` 只有
     当它在同一台机器上时才读得到，而 ``raw=``（适配器会转成 ``base64://``）
     在任何部署下都能用 —— 代价是传输体积涨三分之一，对附件这个量级可以接受。
 
-    ``File`` 段的 exporter 只认 ``path``（不认 ``raw``），所以文件走路径。
+    ``File`` 段的 exporter 只认 ``path``（不认 ``raw``），所以文件走路径；又因为
+    exporter 取的是磁盘名，路径要用 :func:`_send_path` 链接出真实文件名的那份
+    临时副本，发送结束后由调用方删掉（第三个返回值）。
 
-    段里的 url 指向媒体库地址：前端带令牌就能取回，因此**发出的消息在记录里
-    依然能显示图片**。附件上传时就已经在媒体库里定了 id（:meth:`MediaStore.save`
-    返回的地址就是它），所以不存在「返回的地址」与「库里的地址」不一致的情况。
+    段里的 url 指向媒体库地址（内容 md5），前端带令牌就能取回，因此**发出的
+    消息在记录里依然能显示图片**。请求发送那一刻附件已经 ``commit`` 入库，所以
+    这里的地址与库里、与推给前端的完全一致。
     """
     from nonebot_plugin_alconna.uniseg import File, Image
 
@@ -653,24 +697,25 @@ async def _upload_segment(
             'name': record.name,
             'mime': record.mime or None,
         }
-    else:
-        seg = File(path=record.path, name=record.name, mimetype=record.mime or None)
-        payload = {
-            'type': 'file',
-            'url': url,
-            'name': record.name,
-            'mime': record.mime or None,
-            'size': record.size,
-        }
-    return seg, payload
+        return seg, payload, None
+    path, cleanup = await _send_path(record)
+    seg = File(path=path, name=record.name, mimetype=record.mime or None)
+    payload = {
+        'type': 'file',
+        'url': url,
+        'name': record.name,
+        'mime': record.mime or None,
+        'size': record.size,
+    }
+    return seg, payload, cleanup
 
 
 async def _resolve_upload(raw: Any) -> 'MediaRecord':
-    """按 id 取回媒体资源，取不到时抛 404。"""
+    """按 id 取回附件（媒体库或待发送暂存区），取不到时抛 404。"""
     uid = str(raw or '').strip()
     if _media is None:  # pragma: no cover - setup 一定会注入
         raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
-    record = await _media.get(uid)
+    record = await _media.resolve(uid)
     if record is None:
         raise HTTPException(status_code=404, detail=f'附件 {uid or "?"} 不存在或已过期')
     return record
@@ -742,14 +787,20 @@ async def post_send(request: Request) -> dict[str, Any]:
         raise HTTPException(status_code=403, detail='BotUI 未开启附件上传')
 
     # 附件要在发送前取好：一是确认它们都还在（过期会 404），二是把 uniseg 段
-    # 提前构造出来。发送时附件排在正文之后。
+    # 提前构造出来。发送时附件排在正文之后。取好后立刻 commit 进媒体库：按
+    # 内容 md5 落盘，消息段里引用的就是这个稳定地址。
     extra: list[Any] = []
     upload_segments: list[dict[str, Any]] = []
+    cleanup_dirs: list[Path | None] = []
     for uid in upload_ids:
         item = await _resolve_upload(uid)
-        seg, seg_dict = await _upload_segment(item)
+        item = await _media.commit(item.id) if _media is not None else item
+        if item is None:  # pragma: no cover - resolve 已确认存在
+            raise HTTPException(status_code=404, detail=f'附件 {uid} 不存在或已过期')
+        seg, seg_dict, cleanup = await _upload_segment(item)
         extra.append(seg)
         upload_segments.append(seg_dict)
+        cleanup_dirs.append(cleanup)
 
     chat = store.chat(key)
     if chat is None:
@@ -776,6 +827,11 @@ async def post_send(request: Request) -> dict[str, Any]:
     except Exception as e:
         logger.opt(exception=True).warning(f'BotUI failed to send message: {e}')
         raise HTTPException(status_code=502, detail=f'发送失败：{e}') from e
+    finally:
+        # 发送用的临时文件名副本（见 _send_path）只在发送期间需要
+        for directory in cleanup_dirs:
+            if directory is not None:
+                await asyncio.to_thread(shutil.rmtree, directory, ignore_errors=True)
 
     # 主动补一条记录：即使采集钩子因故没生效，WebUI 里也能看到。
     # 段里用的就是媒体库地址，与库里、与推送出去的完全一致（不再有竞态回填）。

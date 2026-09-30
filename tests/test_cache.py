@@ -3,11 +3,12 @@
 媒体库解决的是「媒体直链会过期」这个现实问题，也把原先散落的上传附件与
 收到的媒体合成了一份存储，所以这里重点覆盖四件事：
 
-1. 存取与去重：同一个来源链接反复入库只留一份；
+1. 存取与去重：资源按内容 md5 命名，同样的内容反复入库只留一份；
 2. 回收策略：配额淘汰、ttl / retention、以及「引用」对保留期的影响；
 3. 接口行为：``GET /api/cache``、``POST /api/cache``、``GET/DELETE /api/media/{id}``
    的鉴权与参数校验；
-4. 抓取与回填：``ingest.py`` 把消息里可抓的媒体下载入库并改写段里的地址。
+4. 抓取与回填：``ingest.py`` 把消息里可抓的媒体下载入库并改写段里的地址；
+5. 待发送暂存：``POST /api/upload`` 只把文件放进系统临时目录，发送时才入库。
 
 媒体库是异步的、且必须 attach 到一条真实的 aiosqlite 连接，所以这里的夹具都用
 ``media``（见 conftest.py），它在会话级的测试库连接上建表。
@@ -18,6 +19,7 @@ from __future__ import annotations
 import json
 import time
 import asyncio
+import hashlib
 
 import pytest
 import pytest_asyncio
@@ -33,7 +35,7 @@ SRC = 'http://93.184.216.34/pic.png'
 def test_url_of_and_id_from_url_roundtrip():
     from src.nonebot_plugin_botui import mediastore
 
-    fid = 'AbCdEf123456'
+    fid = '0123456789abcdef0123456789abcdef'
     url = mediastore.url_of(fid)
     assert url.endswith(f'/api/media/{fid}')
     assert mediastore.id_from_url(url) == fid
@@ -94,18 +96,19 @@ async def test_save_and_lookup_by_source_and_url(media):
     assert await media.lookup('http://nope/x') is None
 
 
-async def test_put_dedupes_same_source(media):
-    """同一来源链接第二次入库时只追加引用，不重复占盘。"""
+async def test_put_dedupes_same_content(media):
+    """资源按内容 md5 命名：同样的内容第二次入库只留一份，临时文件被丢弃。"""
     tmp = media.tmp_dir()
 
     first = tmp / 'a.part'
     first.write_bytes(b'0123456789')
     rec1 = await media.put(first, name='a.bin', source=SRC, kind='file')
     assert rec1 is not None
+    assert rec1.id == hashlib.md5(b'0123456789').hexdigest()
 
     second = tmp / 'b.part'
     second.write_bytes(b'0123456789')
-    rec2 = await media.put(second, name='a.bin', source=SRC, kind='file')
+    rec2 = await media.put(second, name='b.bin', source=SRC, kind='file')
     assert rec2 is not None
     assert rec2.id == rec1.id
     # 新的临时文件被丢弃，磁盘上只有一份
@@ -578,3 +581,87 @@ async def test_sent_attachment_stays_reachable(client: AsyncClient, media, botui
     # 库被清空之后才真的 404（证明之前那条就是库里的文件）
     await media.clear('all')
     assert (await client.get(url, headers=HEADERS)).status_code == 404
+
+
+# ── 待发送附件：系统临时目录 + 发送时才入库 ─────────────────────────────
+async def test_stage_keeps_file_out_of_media_store(media):
+    """选中的附件只放在系统临时目录，没有进媒体库、也没有落盘到 blobs/。"""
+    rec = await media.stage(b'hello', name='a.txt', mime='text/plain')
+    assert rec is not None
+    assert rec.pending is True
+    assert rec.id.startswith('p')
+    # 正文在系统临时目录里，而不是媒体库的 blobs/ 下
+    assert media.dir not in rec.path.parents
+    assert rec.path.read_bytes() == b'hello'
+    assert (await media.stats())['files'] == 0
+    assert (await media.stats())['pending'] == 1
+    # pending 时按 id 也能取回（缩略图预览依赖它）
+    assert await media.resolve(rec.id) is not None
+
+
+async def test_commit_moves_staged_file_into_media_store(media):
+    """发送那一刻 commit：按内容 md5 入库，临时文件被收走。"""
+    rec = await media.stage(b'payload', name='报告.txt', mime='text/plain')
+    assert rec is not None
+    assert rec.pending is True
+
+    stored = await media.commit(rec.id)
+    assert stored is not None
+    assert stored.pending is False
+    assert stored.id == hashlib.md5(b'payload').hexdigest()
+    assert stored.name == '报告.txt'
+    assert stored.path.read_bytes() == b'payload'
+    # 临时文件已不在原处，媒体库里有了一份
+    assert not rec.path.exists()
+    assert (await media.stats())['files'] == 1
+    assert (await media.stats())['pending'] == 0
+    # commit 幂等：已入库的 id 直接返回
+    again = await media.commit(stored.id)
+    assert again is not None
+    assert again.id == stored.id
+
+
+async def test_cancel_and_delete_staged_file(media):
+    """点「移除」时删掉临时文件；已入库的资源删除走媒体库。"""
+    rec = await media.stage(b'gone', name='a.bin')
+    assert rec is not None
+    assert await media.cancel(rec.id) is True
+    assert not rec.path.exists()
+    assert (await media.stats())['pending'] == 0
+    # 再删一次已经没了
+    assert await media.cancel(rec.id) is False
+    assert await media.delete(rec.id) is False
+
+
+async def test_cleanup_reclaims_stale_staged_files(media):
+    """选了却一直不发的附件会按 ttl 被回收（临时文件也删掉）。"""
+    rec = await media.stage(b'stale', name='a.bin')
+    assert rec is not None
+    # ttl 100s（见 media 夹具的配置），把时间拨回过去即可触发
+    media._pending[rec.id].created = time.time() - 200
+    assert await media.cleanup() == 1
+    assert (await media.stats())['pending'] == 0
+    assert not rec.path.exists()
+
+
+async def test_upload_then_send_commits_to_media_store(client: AsyncClient, media):
+    """上传接口只暂存；发送后同一 id 变成内容 md5 的媒体库地址。"""
+    from src.nonebot_plugin_botui import api
+
+    png = b'\x89PNG\r\n\x1a\n' + b'z' * 16
+    up = await client.post(
+        '/botui/api/upload?name=pic.png&type=image/png',
+        headers=HEADERS,
+        content=png,
+    )
+    assert up.status_code == 200
+    info = up.json()['file']
+    assert info['pending'] is True
+
+    if api._media is not None:
+        stored = await api._media.commit(info['id'])
+        assert stored is not None
+        assert stored.id == hashlib.md5(png).hexdigest()
+        got = await client.get(f'/botui/api/media/{stored.id}', headers=HEADERS)
+        assert got.status_code == 200
+        assert got.content == png
