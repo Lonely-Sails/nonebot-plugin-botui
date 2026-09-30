@@ -310,9 +310,13 @@ async def test_chat_alias_takes_precedence_and_persists(tmp_path: Path):
     first.enqueue(_record(key, '你好'))
     await first.flush()
     # 适配器给的名称仍在 raw_name 里，展示名不受影响
-    assert first.chat(key).to_dict()['name'] == '测试群'
+    seeded_chat = first.chat(key)
+    assert seeded_chat is not None
+    assert seeded_chat.to_dict()['name'] == '测试群'
     await first.set_chat_alias(key, '我的测试群')
-    data = first.chat(key).to_dict()
+    aliased = first.chat(key)
+    assert aliased is not None
+    data = aliased.to_dict()
     assert data['name'] == '我的测试群'
     assert data['alias'] == '我的测试群'
     assert data['raw_name'] == '测试群'

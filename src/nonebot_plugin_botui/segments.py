@@ -198,8 +198,7 @@ def _seg_media(seg: Any, stype: str) -> dict[str, Any]:
         file=_clip(getattr(seg, 'file', None) or getattr(seg, 'name', None)),
         # QQ 适配器的音频/视频 name 也恒为 audio.mp3 / video.mp4，
         # 同样从链接里还原真实文件名
-        name=resolve_file_name(getattr(seg, 'name', None), url, fallback='')
-        or None,
+        name=resolve_file_name(getattr(seg, 'name', None), url, fallback='') or None,
         mime=_clip(getattr(seg, 'mimetype', None)) or guess_mime(url),
         duration=getattr(seg, 'duration', None),
     )
@@ -779,7 +778,8 @@ def parse_forward_nodes(raw: Any) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     for node in _iter_nodes(raw)[:MAX_FORWARD_NODES]:
         if isinstance(node, dict):
-            payload = node.get('data') if isinstance(node.get('data'), dict) else node
+            candidate = node.get('data')
+            payload = candidate if isinstance(candidate, dict) else node
         else:
             data = getattr(node, 'data', None)
             payload = data if isinstance(data, dict) else {}

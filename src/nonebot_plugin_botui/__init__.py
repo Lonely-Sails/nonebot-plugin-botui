@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import secrets
+from typing import Any
 
 from nonebot import logger, require, get_driver
 from nonebot.plugin import PluginMetadata, inherit_supported_adapters
@@ -350,7 +351,7 @@ async def _on_startup() -> None:
     # 清理周期：媒体库清理要「及时」（上传了没发的附件不该赖着），默认 10 分钟；
     # 配成 0 时退回 6 小时一轮，只做消息记录的回收。
     interval = int(cfg.botui_media_cleanup_interval)
-    trigger = {'minutes': interval} if interval > 0 else {'hours': 6}
+    trigger: dict[str, Any] = {'minutes': interval} if interval > 0 else {'hours': 6}
     scheduler.add_job(
         _cleanup_job,
         'interval',

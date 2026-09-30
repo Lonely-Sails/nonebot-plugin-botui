@@ -744,7 +744,7 @@ class MediaStore:
             return
         assert self._db is not None
         rows = await self._all_rows()
-        changed: list[tuple[str, str, int]] = []
+        changed: list[tuple[str, int, str]] = []
         for row in rows:
             refs = self._parse_list(row['refs'])
             kept = [

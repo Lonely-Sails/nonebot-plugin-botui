@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 import asyncio
 import hashlib
+from typing import Any
 
 import pytest
 import pytest_asyncio
@@ -627,11 +628,15 @@ async def test_send_records_at_with_member_name(client: AsyncClient, botui, seed
 
 
 # ── 实时事件（WebSocket） ───────────────────────────────────────────────
-def _ws_app(scope, receive, send):
+def _ws_app(scope, receive, send) -> Any:
     """取宿主驱动暴露的 ASGI 应用（WebUI 就挂在这上面）"""
     from nonebot import get_driver
+    from nonebot.drivers import ASGIMixin
 
-    return get_driver().asgi(scope, receive, send)
+    driver = get_driver()
+    if not isinstance(driver, ASGIMixin):  # pragma: no cover - 测试固定用 fastapi 驱动
+        pytest.skip('测试需要 FastAPI 驱动')
+    return driver.asgi(scope, receive, send)
 
 
 class _WSClient:
@@ -643,8 +648,7 @@ class _WSClient:
     循环里，行为也更接近真实的 ASGI 服务器。
     """
 
-    def __init__(self, app=None, query: str = ''):
-        self._app = app
+    def __init__(self, query: str = ''):
         self._query = query
         self._to_app: asyncio.Queue = asyncio.Queue()
         self._from_app: asyncio.Queue = asyncio.Queue()
@@ -703,7 +707,7 @@ class _WSClient:
 
 async def test_ws_rejects_missing_token(client: AsyncClient, seeded):
     """握手先 accept 再关闭：这样浏览器能拿到 4401，识别为「令牌不对」"""
-    ws = _WSClient(client._transport.app, 'since=0')
+    ws = _WSClient('since=0')
     first = await ws.connect()
     assert first['type'] == 'accept'
     closed = await ws.receive()
@@ -713,7 +717,7 @@ async def test_ws_rejects_missing_token(client: AsyncClient, seeded):
 
 
 async def test_ws_accepts_token_and_sends_ready(client: AsyncClient, seeded):
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     assert (await ws.connect())['type'] == 'accept'
     ready = await ws.receive()
     assert ready['type'] == 'ready'
@@ -727,7 +731,7 @@ async def test_ws_pushes_new_messages(client: AsyncClient, botui, seeded):
     from src.nonebot_plugin_botui.capture import build_outgoing
 
     store, key = seeded
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     await ws.connect()
     await ws.receive()  # ready
 
@@ -749,7 +753,7 @@ async def test_ws_backfills_after_reconnect(client: AsyncClient, botui, seeded):
     from src.nonebot_plugin_botui.capture import build_outgoing
 
     store, key = seeded
-    probe = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    probe = _WSClient(f'since=0&token={TOKEN}')
     await probe.connect()
     cursor = (await probe.receive())['cursor']
     await probe.close()
@@ -761,7 +765,7 @@ async def test_ws_backfills_after_reconnect(client: AsyncClient, botui, seeded):
         )
     await store.flush()
 
-    ws = _WSClient(client._transport.app, f'since={cursor}&token={TOKEN}')
+    ws = _WSClient(f'since={cursor}&token={TOKEN}')
     await ws.connect()
     texts = []
     for _ in range(2):
@@ -775,7 +779,7 @@ async def test_ws_backfills_after_reconnect(client: AsyncClient, botui, seeded):
 
 async def test_ws_since_zero_does_not_backfill(client: AsyncClient, seeded):
     """刚打开页面的客户端不该收到历史事件（记录它自己会去拉）。"""
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     await ws.connect()
     first = await ws.receive()
     assert first['type'] == 'ready'
@@ -787,7 +791,7 @@ async def test_ws_cross_thread_publish_is_delivered(client: AsyncClient, botui, 
     import threading
 
     _, key = seeded
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     await ws.connect()
     await ws.receive()  # ready
 
@@ -824,7 +828,7 @@ async def test_ws_ping_keeps_connection_alive(client: AsyncClient, seeded, monke
     from src.nonebot_plugin_botui import api
 
     monkeypatch.setattr(api, 'WS_HEARTBEAT', 0.05)
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     await ws.connect()
     await ws.receive()  # ready
     beat = await ws.receive()
@@ -840,7 +844,7 @@ async def test_ws_ignores_other_incoming_text(client: AsyncClient, seeded, monke
     from src.nonebot_plugin_botui import api
 
     monkeypatch.setattr(api, 'WS_HEARTBEAT', 0.05)
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     await ws.connect()
     await ws.receive()  # ready
     await ws.send_text('hello')
@@ -853,7 +857,7 @@ async def test_ws_closed_when_not_ready(client: AsyncClient, seeded, monkeypatch
     from src.nonebot_plugin_botui import api
 
     monkeypatch.setattr(api, '_server', None)
-    ws = _WSClient(client._transport.app, f'since=0&token={TOKEN}')
+    ws = _WSClient(f'since=0&token={TOKEN}')
     assert (await ws.connect())['type'] == 'accept'
     closed = await ws.receive()
     assert closed['type'] == 'close'

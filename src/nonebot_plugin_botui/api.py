@@ -670,13 +670,15 @@ async def ws_events(websocket: WebSocket, since: int = Query(0, ge=0)) -> None:
         await websocket.close(code=1011, reason='BotUI 尚未就绪')
         return
 
-    queue, boundary = _server.subscribe()
+    # 用局部变量捕获，闭包里才能保住「非 None」的收窄（全局变量在闭包内会被放宽）
+    server = _server
+    queue, boundary = server.subscribe()
 
     async def _pump() -> None:
         """推送循环：补发漏掉的、报一个游标、然后一直推新事件。"""
-        for event in _server.backlog(since, boundary):
+        for event in server.backlog(since, boundary):
             await websocket.send_json(event)
-        await websocket.send_json({'type': 'ready', 'cursor': _server.latest})
+        await websocket.send_json({'type': 'ready', 'cursor': server.latest})
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=WS_HEARTBEAT)
