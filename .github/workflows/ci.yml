@@ -6,7 +6,6 @@ on:
       - master
   pull_request:
     paths:
-      # src/** 已经覆盖了 WebUI 的前端资源（src/**/static/**）
       - "src/**"
       - "tests/**"
       - "uv.lock"
