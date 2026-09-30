@@ -193,6 +193,10 @@ svg {
 .icon-btn:hover { background: var(--hover); color: var(--text); }
 .icon-btn:active { background: var(--active); }
 
+/* 会话头部的「备注」按钮：比普通图标钮小一号，紧跟在会话名后面 */
+.head-rename { width: 22px; height: 22px; border-radius: 6px; }
+.head-rename svg { width: 14px; height: 14px; }
+
 /* 主题按钮：深色显示太阳，浅色显示月亮 */
 .ico-sun, .ico-moon { display: none; }
 html[data-theme="dark"] .ico-sun { display: block; }
@@ -1328,6 +1332,24 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 }
 .bot-state.online { color: var(--ok); }
 .bot-check { width: 15px; height: 15px; flex: none; color: var(--accent); }
+/* 机器人备注按钮：平时淡出，悬停该行才显现，避免挤占状态标记的位置 */
+.bot-item-rename {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex: none;
+  border-radius: 6px;
+  color: var(--muted);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.12s var(--ease), background 0.12s var(--ease), color 0.12s var(--ease);
+}
+.bot-item:hover .bot-item-rename { opacity: 1; }
+.bot-item-rename:hover,
+.bot-item-rename:focus-visible { background: var(--hover); color: var(--text); opacity: 1; }
+.bot-item-rename svg { width: 13px; height: 13px; }
 .bot-menu-empty { padding: 12px 10px; font-size: 12px; color: var(--faint); text-align: center; }
 .bot-menu-sep { height: 1px; margin: 4px 6px; background: var(--border); }
 
@@ -1478,6 +1500,53 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 .settings-switch input:disabled + .switch-track { opacity: 0.45; }
 .switch-text { font-size: 12.5px; color: var(--text-dim); }
 .settings-switch input:disabled ~ .switch-text { opacity: 0.55; }
+
+/* ---------- 备注（别名）编辑弹窗 ---------- */
+.alias {
+  position: fixed;
+  inset: 0;
+  z-index: 78;
+  background: rgba(0, 0, 0, 0.62);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  animation: fade 0.16s var(--ease);
+}
+.alias-card {
+  width: min(380px, 92vw);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-lg);
+  background: var(--panel);
+  box-shadow: var(--shadow-lg);
+  padding: 16px;
+}
+.alias-title { margin: 0 0 4px; font-size: 14px; font-weight: 600; color: var(--text); }
+.alias-desc { margin: 0 0 12px; font-size: 12px; line-height: 1.6; color: var(--faint); }
+.alias-input {
+  width: 100%;
+  box-sizing: border-box;
+  height: 36px;
+  padding: 0 11px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel-2);
+  color: var(--text);
+}
+.alias-input:focus { outline: none; border-color: var(--accent); }
+.alias-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 14px;
+}
+.alias-actions .settings-btn { padding: 7px 16px; }
+.alias-actions .settings-btn.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.alias-actions .settings-btn.primary:hover { background: var(--accent); filter: brightness(1.08); }
 
 /* ---------- 令牌输入页 ---------- */
 .gate {

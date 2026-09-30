@@ -406,6 +406,81 @@ async def get_members(
     return {'chat': chat, 'members': [m.to_dict() for m in items]}
 
 
+#: 备注最大长度（按字符计）：太长会撑破界面，也没必要
+MAX_ALIAS_LEN = 64
+
+
+def _clean_alias(value: Any) -> str:
+    """规整备注文本：去首尾空白、折行，并限制长度。
+
+    备注是纯展示信息，不做任何转义——前端统一用 textContent 插入，天然防 XSS。
+    """
+    text = str(value or '').replace('\r', ' ').replace('\n', ' ').strip()
+    return text[:MAX_ALIAS_LEN]
+
+
+@router.post('/api/rename')
+async def post_rename(request: Request) -> dict[str, Any]:
+    """设置会话/成员/机器人的备注（别名）。
+
+    有些适配器拿不到真实的群名或用户昵称（拿到的可能只是一串 ID，或者干脆
+    是空的），界面上就只剩群号可看。备注让用户自己给它们起个认得出的名字，
+    只影响展示，不写入聊天记录，也不会被适配器后续上报的名称覆盖。
+
+    请求体：``{kind: 'chat'|'member'|'bot', alias: str, ...}``；
+    ``chat``/``member`` 需要 ``chat``；``member`` 还需要 ``user_id``；
+    ``bot`` 需要 ``self_id``。``alias`` 传空串表示清除备注。
+    """
+    _guard_write(request)
+    store = _require_store()
+    try:
+        payload = await request.json()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f'请求体不是合法 JSON：{e}') from e
+
+    kind = str(payload.get('kind') or '').strip()
+    alias = _clean_alias(payload.get('alias'))
+    if kind == 'chat':
+        key = str(payload.get('chat') or '').strip()
+        if not key:
+            raise HTTPException(status_code=400, detail='缺少 chat 参数')
+        chat = await store.set_chat_alias(key, alias)
+        if chat is None:
+            raise HTTPException(status_code=404, detail='会话不存在')
+        if _server is not None:
+            _server.publish_chat(chat)
+        return {
+            'ok': True,
+            'kind': kind,
+            'alias': alias or None,
+            'chat': chat.to_dict(),
+        }
+    if kind == 'member':
+        key = str(payload.get('chat') or '').strip()
+        user_id = str(payload.get('user_id') or '').strip()
+        if not key or not user_id:
+            raise HTTPException(status_code=400, detail='缺少 chat 或 user_id 参数')
+        await store.set_member_alias(key, user_id, alias)
+        member = store.member(key, user_id)
+        return {
+            'ok': True,
+            'kind': kind,
+            'alias': alias or None,
+            'member': member.to_dict() if member is not None else None,
+        }
+    if kind == 'bot':
+        self_id = str(payload.get('self_id') or '').strip()
+        if not self_id:
+            raise HTTPException(status_code=400, detail='缺少 self_id 参数')
+        bot = await store.set_bot_alias(self_id, alias)
+        if bot is None:
+            raise HTTPException(status_code=404, detail='机器人不存在')
+        if _server is not None:
+            _server.publish_bot(bot)
+        return {'ok': True, 'kind': kind, 'alias': alias or None, 'bot': bot.to_dict()}
+    raise HTTPException(status_code=400, detail=f'未知的 kind：{kind or "(空)"}')
+
+
 @router.get('/api/search')
 async def get_search(
     request: Request,
@@ -898,10 +973,12 @@ async def _payload_segments(
     for target in at_list:
         name = ''
         if store is not None and chat_key:
-            # 名册里记过昵称就带上，界面上显示「@小明」而不是「@10001」
+            # 名册里记过昵称/备注就带上，界面上显示「@小明」而不是「@10001」
             member = store.member(chat_key, target)
-            if member is not None and member.name and member.name != target:
-                name = member.name
+            if member is not None:
+                label = member.alias or member.name
+                if label and label != target:
+                    name = label
         segments.append({'type': 'at', 'target': target, 'name': name or None})
     if at_list and text:
         segments.append({'type': 'text', 'text': ' '})

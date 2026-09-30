@@ -102,6 +102,7 @@ const state = {
   memberMap: new Map(),     // 成员 id -> 成员（用于把 @ 显示成昵称）
   atQuery: '',              // @ 菜单的搜索词
   ctxMsg: null,             // 右键菜单目标消息
+  aliasTarget: null,        // 正在编辑备注的目标（{kind, ...}）
   sep: { day: '', time: 0 },// 分隔符状态
   newCount: 0               // 未读新消息数（悬浮按钮）
 };
@@ -143,6 +144,7 @@ const el = {
   botMenu: $('botMenu'),
   headAvatar: $('headAvatar'),
   headName: $('headName'),
+  headRenameBtn: $('headRenameBtn'),
   headKind: $('headKind'),
   headSub: $('headSub'),
   msgBox: $('msgViewport'),
@@ -171,6 +173,12 @@ const el = {
   fileViewerSave: $('fileViewerSave'),
   ctxMenu: $('ctxMenu'),
   dropOverlay: $('dropOverlay'),
+  aliasDialog: $('aliasDialog'),
+  aliasTitle: $('aliasTitle'),
+  aliasDesc: $('aliasDesc'),
+  aliasInput: $('aliasInput'),
+  aliasClear: $('aliasClear'),
+  aliasSave: $('aliasSave'),
   gate: $('gate'),
   gateForm: $('gateForm'),
   gateInput: $('gateInput'),
@@ -852,6 +860,32 @@ function renderBotMenu() {
 
     if (active) item.appendChild(iconCheck());
 
+    // 备注按钮：给机器人起一个认得出的名字（悬停显示）。
+    // 用 span 而不是 button —— 整个菜单项本身就是个 <button>，嵌套按钮是无效 HTML。
+    const rename = h('span', 'bot-item-rename');
+    rename.setAttribute('role', 'button');
+    rename.setAttribute('tabindex', '0');
+    rename.title = '设置备注';
+    rename.setAttribute('aria-label', '设置机器人备注');
+    const pencil = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+    pencil.setAttribute('viewBox', '0 0 24 24');
+    pencil.setAttribute('aria-hidden', 'true');
+    const pp = document.createElementNS('http://www.w3.org/2000/svg', 'path');
+    pp.setAttribute('d', 'M4 20h4l10-10-4-4L4 16v4z');
+    pencil.appendChild(pp);
+    rename.appendChild(pencil);
+    const startRename = (ev) => {
+      ev.stopPropagation();
+      ev.preventDefault();
+      closeBotMenu();
+      openAliasDialog({ kind: 'bot', self_id: bot.self_id, alias: bot.alias || '' });
+    };
+    rename.addEventListener('click', startRename);
+    rename.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') startRename(ev);
+    });
+    item.appendChild(rename);
+
     item.addEventListener('click', () => {
       closeBotMenu();
       selectBot(bot.self_id);
@@ -917,6 +951,7 @@ async function selectBot(selfId) {
   el.msgList.textContent = '';
   el.searchInput.value = '';
   state.search = '';
+  closeAliasDialog();
   renderBotSwitch();
   renderChats();
   renderHead();
@@ -1269,6 +1304,88 @@ function notifyMessage(msg, isOpen) {
   playNotifySound();
 }
 
+/* ================== 4e. 备注（别名） ==================
+   有些适配器拿不到真实的群名或用户昵称，界面上就只剩一串号码。备注让用户
+   自己给会话/成员/机器人起个认得出的名字，只影响展示，不写入聊天记录，也
+   不会被适配器后续上报的名称覆盖。同时只能打开一个编辑框，目标存在 state 里。 */
+
+function aliasTargetName(chat) {
+  if (!chat) return '会话';
+  return chat.alias ? String(chat.alias) : (hasText(chat.name) ? String(chat.name) : String(chat.id || '会话'));
+}
+
+/** 打开备注编辑框：target 形如 {kind:'chat'|'member'|'bot', ...} */
+function openAliasDialog(target) {
+  if (!target || !target.kind) return;
+  if (state.meta && state.meta.write_enabled === false) { toast('只读模式，无法设置备注', true); return; }
+  state.aliasTarget = target;
+  el.aliasTitle.textContent = target.kind === 'chat' ? '会话备注'
+    : (target.kind === 'member' ? '成员备注' : '机器人备注');
+  el.aliasDesc.textContent = '备注只影响界面显示，不会写入聊天记录，也不会被适配器上报的名称覆盖。'
+    + '留空并保存即可清除。';
+  el.aliasInput.value = target.alias ? String(target.alias) : '';
+  el.aliasDialog.hidden = false;
+  el.aliasClear.hidden = !target.alias;
+  el.aliasInput.focus();
+  el.aliasInput.select();
+}
+
+function closeAliasDialog() {
+  if (el.aliasDialog.hidden) return;
+  el.aliasDialog.hidden = true;
+  state.aliasTarget = null;
+  el.aliasInput.value = '';
+}
+
+async function saveAlias(alias) {
+  const target = state.aliasTarget;
+  if (!target) return;
+  const body = Object.assign({}, target, { alias: alias || '' });
+  try {
+    const data = await api('/rename', { method: 'POST', body: body });
+    applyAliasResult(target, data);
+    closeAliasDialog();
+    toast(alias ? '备注已保存' : '备注已清除');
+  } catch (err) {
+    if (!err || err.status !== 401) toast(err && err.message ? err.message : '备注保存失败', true);
+  }
+}
+
+/** 把服务端返回的结果落到本地状态（不整表重拉） */
+function applyAliasResult(target, data) {
+  if (target.kind === 'chat' && data && data.chat) {
+    const chat = state.chatMap.get(String(data.chat.key));
+    if (chat) {
+      chat.alias = data.chat.alias || '';
+      chat.name = data.chat.name;         // 服务端已算好展示名（备注优先）
+      chat.raw_name = data.chat.raw_name || null;
+    }
+    if (state.current && state.current.key === String(data.chat.key)) {
+      state.current = state.chatMap.get(String(data.chat.key)) || state.current;
+      renderHead();
+    }
+    sortChats();
+    renderChats();
+    return;
+  }
+  if (target.kind === 'member' && data && data.member) {
+    const key = String(target.chat);
+    const member = data.member;
+    const idx = state.members.findIndex((m) => String(m.id) === String(member.id));
+    if (idx >= 0) state.members[idx] = member; else state.members.push(member);
+    state.memberMap.set(String(member.id), member);
+    if (!el.atMenu.hidden) renderAtMenu();
+    renderPendingAt();
+    return;
+  }
+  if (target.kind === 'bot' && data && data.bot) {
+    const idx = state.bots.findIndex((b) => b.self_id === String(data.bot.self_id));
+    if (idx >= 0) state.bots[idx] = Object.assign({}, state.bots[idx], data.bot);
+    renderBotSwitch();
+    renderConnMeta();
+  }
+}
+
 /* ============================ 5. 会话列表 ============================ */
 
 function sortChats() {
@@ -1552,6 +1669,7 @@ function renderHead() {
     el.headAvatar.appendChild(placeholder);
     el.headName.textContent = '未选择会话';
     el.headKind.hidden = true;
+    el.headRenameBtn.hidden = true;
     el.headSub.textContent = '从左侧选择一个会话开始查看消息';
     return;
   }
@@ -1559,11 +1677,13 @@ function renderHead() {
   const isGroup = chat.kind === 'group';
   el.headAvatar.appendChild(buildAvatar(chat.name, chat.avatar, 'lg'));
   el.headName.textContent = chat.name;
+  el.headRenameBtn.hidden = !(state.meta && state.meta.write_enabled !== false);
   el.headKind.hidden = false;
   el.headKind.textContent = isGroup ? '群聊' : '私聊';
   el.headKind.className = 'badge' + (isGroup ? '' : ' kind-private');
 
   const parts = [];
+  if (chat.alias && hasText(chat.raw_name)) parts.push('原名 ' + String(chat.raw_name));
   if (hasText(chat.id)) parts.push((isGroup ? '群号 ' : 'QQ ') + chat.id);
   const count = Number(chat.member_count);
   if (Number.isFinite(count) && count > 0) parts.push(count + ' 人');
@@ -2539,6 +2659,18 @@ function buildAtItem(member, isAll) {
     closeAtMenu();
     el.input.focus();
   });
+  // 右键成员：给他起备注（适配器拿不到真实昵称时很有用）
+  if (!isAll) {
+    btn.addEventListener('contextmenu', (ev) => {
+      ev.preventDefault();
+      openAliasDialog({
+        kind: 'member',
+        chat: state.current ? state.current.key : '',
+        user_id: id,
+        alias: member.alias || ''
+      });
+    });
+  }
   return btn;
 }
 
@@ -2826,6 +2958,16 @@ function openCtxMenu(x, y, msg) {
     { label: '复制文本', run: () => copyText(hasText(msg.text) ? msg.text : previewOf(msg)) },
     { label: '回复', run: () => setReply(msg) },
     { label: '预览文件', run: () => openFilePreview(fileSeg), disabled: !previewable },
+    {
+      label: '备注发言人',
+      run: () => openAliasDialog({
+        kind: 'member',
+        chat: msg.chat,
+        user_id: msg.user_id,
+        alias: (state.memberMap.get(String(msg.user_id)) || {}).alias || ''
+      }),
+      disabled: msg.direction === 'out' || !hasText(msg.user_id)
+    },
     { label: '撤回', run: () => recallMessage(msg), disabled: !recallable, danger: true },
     { sep: true },
     { label: '导出聊天记录', run: () => exportChat() },
@@ -2845,6 +2987,36 @@ function openCtxMenu(x, y, msg) {
     menu.appendChild(btn);
   });
 
+  positionMenu(menu, x, y);
+}
+
+/** 会话列表的右键菜单（目前只有「设置备注」），与消息右键菜单共用定位逻辑 */
+function openChatMenu(x, y, chat) {
+  const menu = el.ctxMenu;
+  menu.textContent = '';
+  state.ctxMsg = null;
+  const items = [
+    {
+      label: '设置备注',
+      run: () => openAliasDialog({
+        kind: 'chat', chat: chat.key, alias: chat.alias || ''
+      }),
+      disabled: !!(state.meta && state.meta.write_enabled === false)
+    }
+  ];
+  items.forEach((item) => {
+    const btn = h('button', 'ctx-item', item.label);
+    btn.type = 'button';
+    btn.setAttribute('role', 'menuitem');
+    if (item.disabled) btn.disabled = true;
+    btn.addEventListener('click', () => { closeCtxMenu(); item.run(); });
+    menu.appendChild(btn);
+  });
+  positionMenu(menu, x, y);
+}
+
+/** 把右键菜单摆到鼠标位置，并确保不超出视口 */
+function positionMenu(menu, x, y) {
   menu.hidden = false;
   const rect = menu.getBoundingClientRect();
   menu.style.left = Math.max(6, Math.min(x, window.innerWidth - rect.width - 6)) + 'px';
@@ -3159,6 +3331,14 @@ function handleEvent(ev) {
     return;
   }
 
+  // 会话资料变化（比如别处设置了备注）：合并进列表并刷新头部
+  if (ev.type === 'chat' && ev.chat && hasText(ev.chat.key)) {
+    if (botOfKey(String(ev.chat.key)) !== state.botId) return;
+    mergeChat(ev.chat);
+    renderChats();
+    return;
+  }
+
   if (ev.type === 'message' && ev.message) {
     const msg = ev.message;
     const key = String(msg.chat);
@@ -3223,6 +3403,8 @@ function mergeChat(chat) {
   const existing = state.chatMap.get(key);
   if (existing) {
     if (hasText(chat.name)) existing.name = chat.name;
+    if (chat.alias !== undefined) existing.alias = chat.alias;
+    if (chat.raw_name !== undefined) existing.raw_name = chat.raw_name;
     if (chat.avatar !== undefined) existing.avatar = chat.avatar;
     if (hasText(chat.kind)) existing.kind = chat.kind;
     if (hasText(chat.id)) existing.id = chat.id;
@@ -3329,10 +3511,37 @@ function bindEvents() {
     if (item && item.dataset.key) openChat(item.dataset.key);
   });
 
+  // 会话列表右键：给会话设置备注（适配器拿不到群名时很有用）
+  el.chatList.addEventListener('contextmenu', (ev) => {
+    const item = closestFrom(ev.target, '.chat-item');
+    if (!item || !item.dataset.key) return;
+    const chat = state.chatMap.get(item.dataset.key);
+    if (!chat) return;
+    ev.preventDefault();
+    openChatMenu(ev.clientX, ev.clientY, chat);
+  });
+
   // 窄屏返回列表
   el.backBtn.addEventListener('click', () => { el.app.dataset.pane = 'sidebar'; });
 
   el.reloadBtn.addEventListener('click', () => { reloadCurrent(); });
+
+  // 会话备注：头部铅笔按钮
+  el.headRenameBtn.addEventListener('click', () => {
+    if (!state.current) return;
+    openAliasDialog({ kind: 'chat', chat: state.current.key, alias: state.current.alias || '' });
+  });
+
+  // 备注编辑框：保存 / 清除 / 回车 / Esc / 点遮罩关闭
+  el.aliasSave.addEventListener('click', () => saveAlias(el.aliasInput.value.trim()));
+  el.aliasClear.addEventListener('click', () => saveAlias(''));
+  el.aliasInput.addEventListener('keydown', (ev) => {
+    if (ev.key === 'Enter') { ev.preventDefault(); saveAlias(el.aliasInput.value.trim()); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); closeAliasDialog(); }
+  });
+  el.aliasDialog.addEventListener('click', (ev) => {
+    if (ev.target === el.aliasDialog) closeAliasDialog();
+  });
 
   // 设置面板：右上角齿轮开合，面板内的缓存按钮各管一个清理模式
   el.settingsBtn.addEventListener('click', toggleSettings);
@@ -3472,6 +3681,7 @@ function bindEvents() {
   // Esc / 点击空白关闭浮层
   document.addEventListener('keydown', (ev) => {
     if (ev.key !== 'Escape') return;
+    if (!el.aliasDialog.hidden) { closeAliasDialog(); return; }
     if (!el.settings.hidden) { closeSettings(); return; }
     if (!el.fileViewer.hidden) { closeFileViewer(); return; }
     if (!el.lightbox.hidden) { closeLightbox(); return; }

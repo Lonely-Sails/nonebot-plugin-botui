@@ -96,6 +96,7 @@ class BotRecord:
     adapter: str = ''
     scope: str = ''
     name: str = ''
+    alias: str = ''
     avatar: str = ''
     online: bool = False
     first_seen: float = 0.0
@@ -106,7 +107,10 @@ class BotRecord:
             'self_id': self.self_id,
             'adapter': self.adapter or None,
             'scope': self.scope or None,
-            'name': self.name or self.self_id,
+            # name 是**展示名**（用户备注优先），raw_name 才是适配器给的名称
+            'name': self.alias or self.name or self.self_id,
+            'alias': self.alias or None,
+            'raw_name': self.name or None,
             'avatar': self.avatar or None,
             'online': bool(self.online),
             'first_seen': self.first_seen,
@@ -126,6 +130,7 @@ class ChatRecord:
     self_id: str = ''
     parent_id: str = ''
     name: str = ''
+    alias: str = ''
     avatar: str = ''
     member_count: int | None = None
     last_text: str = ''
@@ -138,7 +143,11 @@ class ChatRecord:
             'key': self.key,
             'kind': self.kind,
             'id': self.chat_id,
-            'name': self.name or self.chat_id,
+            # name 是**展示名**（用户备注优先）：适配器拿不到真实群名/昵称时，
+            # 用户手动设置的备注就顶上来；raw_name 保留适配器给的原始名称。
+            'name': self.alias or self.name or self.chat_id,
+            'alias': self.alias or None,
+            'raw_name': self.name or None,
             'avatar': self.avatar or None,
             'adapter': self.adapter or None,
             'self_id': self.self_id or None,

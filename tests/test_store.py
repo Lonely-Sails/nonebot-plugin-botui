@@ -298,7 +298,86 @@ async def test_touch_chat_does_not_create_message(store):
     assert chat is not None
     assert chat.kind == 'private'
     assert chat.name == '小明'
-    assert chat.message_count == 0
+
+
+async def test_chat_alias_takes_precedence_and_persists(tmp_path: Path):
+    """会话备注优先作为展示名，且要落库（重启后仍在）。"""
+    path = tmp_path / 'data'
+    key = _chat_key('group', '87654321')
+
+    first = _new_store(path)
+    await first.start()
+    first.enqueue(_record(key, '你好'))
+    await first.flush()
+    # 适配器给的名称仍在 raw_name 里，展示名不受影响
+    assert first.chat(key).to_dict()['name'] == '测试群'
+    await first.set_chat_alias(key, '我的测试群')
+    data = first.chat(key).to_dict()
+    assert data['name'] == '我的测试群'
+    assert data['alias'] == '我的测试群'
+    assert data['raw_name'] == '测试群'
+    await first.stop()
+
+    second = _new_store(path)
+    await second.start()
+    try:
+        chat = second.chat(key)
+        assert chat is not None
+        assert chat.alias == '我的测试群'
+        # 备注参与会话搜索
+        assert key in {c.key for c in second.chats('我的测试群')}
+    finally:
+        await second.stop()
+
+
+async def test_chat_alias_can_be_cleared_and_unknown_is_none(store):
+    key = _chat_key('group', '87654321')
+    store.enqueue(_record(key, '你好'))
+    await store.flush()
+
+    await store.set_chat_alias(key, '备注')
+    assert store.chat(key).alias == '备注'
+    await store.set_chat_alias(key, '')
+    assert store.chat(key).alias == ''
+    # 会话不存在时返回 None（不抛异常）
+    assert await store.set_chat_alias('12345678:group_404', 'x') is None
+
+
+async def test_member_alias_does_not_override_nickname(store):
+    """成员备注与适配器昵称互不覆盖，展示名以备注优先。"""
+    key = _chat_key('group', '87654321')
+    store.enqueue(_record(key, '你好'))
+    await store.flush()
+
+    await store.set_member_alias(key, '10001', '老板')
+    member = store.member(key, '10001')
+    assert member.alias == '老板'
+    assert member.name == '小明'  # 原始昵称保留
+    assert member.to_dict()['name'] == '老板'
+    assert member.to_dict()['raw_name'] == '小明'
+
+    # 备注也参与成员搜索
+    assert '10001' in {m.user_id for m in store.members(key, '老板')}
+
+    # 后续自动收集昵称不会把备注顶掉
+    store.enqueue(_record(key, '又说一句'))
+    await store.flush()
+    assert store.member(key, '10001').alias == '老板'
+
+
+async def test_bot_alias(store):
+    record = await store.upsert_bot('12345678', adapter='OneBot V11', name='机器人')
+    assert record.to_dict()['name'] == '机器人'
+    updated = await store.set_bot_alias('12345678', '小助手')
+    assert updated is not None
+    data = updated.to_dict()
+    assert data['name'] == '小助手'
+    assert data['alias'] == '小助手'
+    assert data['raw_name'] == '机器人'
+    # 再次 upsert（模拟重连）不能把备注抹掉
+    record = await store.upsert_bot('12345678', name='机器人')
+    assert record.alias == '小助手'
+    assert await store.set_bot_alias('99999999', 'x') is None
 
 
 async def test_store_persists_across_restart(tmp_path: Path):

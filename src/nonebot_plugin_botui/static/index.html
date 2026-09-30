@@ -61,6 +61,9 @@
         <div class="head-main">
           <div class="head-name-row">
             <span class="head-name" id="headName">未选择会话</span>
+            <button class="icon-btn head-rename" id="headRenameBtn" type="button" title="设置会话备注" aria-label="设置会话备注" hidden>
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 20h4l10-10-4-4L4 16v4z"/><path d="M13.5 6.5l4 4"/></svg>
+            </button>
             <span class="badge" id="headKind" hidden></span>
           </div>
           <div class="head-sub" id="headSub">从左侧选择一个会话开始查看消息</div>
@@ -139,6 +142,19 @@
 
   <!-- 消息右键菜单 -->
   <div class="ctx-menu" id="ctxMenu" hidden role="menu"></div>
+
+  <!-- 备注（别名）编辑弹窗：给会话 / 成员 / 机器人起一个认得出的名字 -->
+  <div class="alias" id="aliasDialog" hidden role="dialog" aria-modal="true" aria-labelledby="aliasTitle">
+    <div class="alias-card">
+      <h2 class="alias-title" id="aliasTitle">设置备注</h2>
+      <p class="alias-desc" id="aliasDesc">备注只影响界面显示，不会写入聊天记录。</p>
+      <input type="text" class="alias-input" id="aliasInput" maxlength="64" autocomplete="off" spellcheck="false" aria-label="备注">
+      <div class="alias-actions">
+        <button class="settings-btn" id="aliasClear" type="button">清除备注</button>
+        <button class="settings-btn primary" id="aliasSave" type="button">保存</button>
+      </div>
+    </div>
+  </div>
 
   <!-- 设置面板：目前只有本地缓存管理，后续设置项继续往里加 -->
   <div class="settings" id="settings" hidden role="dialog" aria-modal="true" aria-labelledby="settingsTitle">

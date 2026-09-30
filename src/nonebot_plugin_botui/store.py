@@ -37,6 +37,7 @@ CREATE TABLE IF NOT EXISTS chats (
     self_id         TEXT DEFAULT '',
     parent_id       TEXT DEFAULT '',
     name            TEXT DEFAULT '',
+    alias           TEXT DEFAULT '',
     avatar          TEXT DEFAULT '',
     member_count    INTEGER,
     last_text       TEXT DEFAULT '',
@@ -83,6 +84,7 @@ CREATE TABLE IF NOT EXISTS members (
     chat_key    TEXT NOT NULL,
     user_id     TEXT NOT NULL,
     name        TEXT DEFAULT '',
+    alias       TEXT DEFAULT '',
     role        TEXT DEFAULT '',
     avatar      TEXT DEFAULT '',
     last_at     REAL DEFAULT 0,
@@ -98,6 +100,7 @@ CREATE TABLE IF NOT EXISTS bots (
     adapter     TEXT DEFAULT '',
     scope       TEXT DEFAULT '',
     name        TEXT DEFAULT '',
+    alias       TEXT DEFAULT '',
     avatar      TEXT DEFAULT '',
     online      INTEGER DEFAULT 0,
     first_seen  REAL DEFAULT 0,
@@ -171,6 +174,7 @@ class MemberRecord:
 
     user_id: str
     name: str = ''
+    alias: str = ''
     role: str = ''
     avatar: str = ''
     last_at: float = 0.0
@@ -179,7 +183,10 @@ class MemberRecord:
     def to_dict(self) -> dict[str, Any]:
         return {
             'id': self.user_id,
-            'name': self.name or self.user_id,
+            # 展示名：用户备注优先，其次才是适配器给的昵称/号码
+            'name': self.alias or self.name or self.user_id,
+            'alias': self.alias or None,
+            'raw_name': self.name or None,
             'role': self.role or None,
             'avatar': self.avatar or None,
             'last_at': self.last_at,
@@ -293,6 +300,7 @@ class MessageStore:
                 self_id=row['self_id'] or '',
                 parent_id=row['parent_id'] or '',
                 name=row['name'] or '',
+                alias=row['alias'] or '',
                 avatar=row['avatar'] or '',
                 member_count=row['member_count'],
                 last_text=row['last_text'] or '',
@@ -327,6 +335,7 @@ class MessageStore:
                 adapter=row['adapter'] or '',
                 scope=row['scope'] or '',
                 name=row['name'] or '',
+                alias=row['alias'] or '',
                 avatar=row['avatar'] or '',
                 online=False,
                 first_seen=row['first_seen'] or 0.0,
@@ -352,6 +361,7 @@ class MessageStore:
             bucket[row['user_id']] = MemberRecord(
                 user_id=row['user_id'],
                 name=row['name'] or '',
+                alias=row['alias'] or '',
                 role=row['role'] or '',
                 avatar=row['avatar'] or '',
                 last_at=row['last_at'] or 0.0,
@@ -663,6 +673,7 @@ class MessageStore:
                 c
                 for c in items
                 if q in (c.name or '').lower()
+                or q in (c.alias or '').lower()
                 or q in c.chat_id.lower()
                 or q in c.last_text.lower()
             ]
@@ -670,6 +681,72 @@ class MessageStore:
 
     def chat(self, key: str) -> ChatRecord | None:
         return self._chats.get(key)
+
+    # ── 名字备注（别名） ────────────────────────────────────────────
+    # 有些适配器拿不到真实的群名或用户昵称（要么只有一串 ID，要么名称
+    # 随时变），所以允许给会话、成员、机器人起一个人工备注。备注只影响
+    # **界面展示**：它不进入聊天记录，也不会被适配器后续上报的名称覆盖。
+
+    async def set_chat_alias(self, key: str, alias: str) -> ChatRecord | None:
+        """给会话起备注（传空串则清除备注）"""
+        alias = (alias or '').strip()
+        chat = self._chats.get(key)
+        if chat is None:
+            return None
+        chat.alias = alias
+        if self._db is None:
+            return chat
+        try:
+            async with self._lock:
+                await self._db.execute(
+                    'UPDATE chats SET alias = ? WHERE key = ?', (alias, key)
+                )
+                await self._db.commit()
+        except Exception as e:  # pragma: no cover - 备注失败不影响主流程
+            logger.debug(f'Failed to rename chat {key}: {e}')
+        return chat
+
+    async def set_member_alias(self, key: str, user_id: str, alias: str) -> None:
+        """给成员起备注（传空串则清除备注）"""
+        alias = (alias or '').strip()
+        member = self._members.get(key, {}).get(str(user_id))
+        if member is None:
+            member = self._remember_member(key, str(user_id), ts=now_ts())
+        member.alias = alias
+        if self._db is None:
+            return
+        try:
+            async with self._lock:
+                await self._db.execute(
+                    'INSERT INTO members (chat_key, user_id, alias, last_at) '
+                    'VALUES (?, ?, ?, ?) '
+                    'ON CONFLICT(chat_key, user_id) DO UPDATE SET '
+                    'alias = excluded.alias',
+                    (key, str(user_id), alias, now_ts()),
+                )
+                await self._db.commit()
+        except Exception as e:  # pragma: no cover - 备注失败不影响主流程
+            logger.debug(f'Failed to rename member {key}/{user_id}: {e}')
+
+    async def set_bot_alias(self, self_id: str, alias: str) -> BotRecord | None:
+        """给机器人起备注（传空串则清除备注）"""
+        alias = (alias or '').strip()
+        record = self._bots.get(str(self_id or ''))
+        if record is None:
+            return None
+        record.alias = alias
+        if self._db is None:
+            return record
+        try:
+            async with self._lock:
+                await self._db.execute(
+                    'UPDATE bots SET alias = ? WHERE self_id = ?',
+                    (alias, record.self_id),
+                )
+                await self._db.commit()
+        except Exception as e:  # pragma: no cover - 备注失败不影响主流程
+            logger.debug(f'Failed to rename bot {self_id}: {e}')
+        return record
 
     # ── 机器人账号 ──────────────────────────────────────────────────────
     def bots(self) -> list[BotRecord]:
@@ -699,6 +776,9 @@ class MessageStore:
         ``online`` 为 None 表示不改动在线状态（例如只是补昵称）；字段为空的
         参数不会覆盖已有值（COALESCE 风格），免得一次降级的适配器信息把之前
         记下的昵称、头像抹掉。
+
+        ``alias``（用户备注）不在这里设置：连接钩子只上报适配器给的名称，
+        备注由 :meth:`set_bot_alias` 单独维护，两者互不覆盖。
         """
         self_id = str(self_id or '')
         if not self_id:
@@ -722,9 +802,9 @@ class MessageStore:
             async with self._lock:
                 await self._db.execute(
                     """
-                    INSERT INTO bots (self_id, adapter, scope, name, avatar,
+                    INSERT INTO bots (self_id, adapter, scope, name, alias, avatar,
                                       online, first_seen, last_seen)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                     ON CONFLICT(self_id) DO UPDATE SET
                         adapter = COALESCE(NULLIF(excluded.adapter, ''), bots.adapter),
                         scope = COALESCE(NULLIF(excluded.scope, ''), bots.scope),
@@ -738,6 +818,7 @@ class MessageStore:
                         record.adapter,
                         record.scope,
                         record.name,
+                        record.alias,
                         record.avatar,
                         1 if record.online else 0,
                         record.first_seen,
@@ -772,7 +853,11 @@ class MessageStore:
         )
         if query:
             q = query.strip().lower()
-            items = [m for m in items if q in m.name.lower() or q in m.user_id.lower()]
+            items = [
+                m
+                for m in items
+                if q in m.name.lower() or q in m.alias.lower() or q in m.user_id.lower()
+            ]
         return items[: max(1, min(1000, int(limit)))]
 
     def member(self, key: str, user_id: str) -> MemberRecord | None:

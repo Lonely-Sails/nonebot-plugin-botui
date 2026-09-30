@@ -373,6 +373,156 @@ async def test_members_empty_for_unknown_chat(client: AsyncClient, seeded):
     assert resp.json()['members'] == []
 
 
+# ── 备注（别名） ────────────────────────────────────────────────────────
+async def test_rename_requires_write_mode(client: AsyncClient, botui, seeded):
+    """只读模式下不允许改备注。"""
+    botui.cfg.botui_write_enabled = False
+    try:
+        resp = await client.post(
+            '/botui/api/rename',
+            headers=HEADERS,
+            json={'kind': 'chat', 'chat': seeded[1], 'alias': 'x'},
+        )
+    finally:
+        botui.cfg.botui_write_enabled = True
+    assert resp.status_code == 403
+
+
+async def test_rename_requires_token(client: AsyncClient, seeded):
+    resp = await client.post(
+        '/botui/api/rename',
+        json={'kind': 'chat', 'chat': seeded[1], 'alias': 'x'},
+    )
+    assert resp.status_code == 401
+
+
+async def test_rename_chat_shows_alias_in_chats(client: AsyncClient, seeded):
+    """给会话设备注后，列表里的名称换成备注，原始名称留在 raw_name。"""
+    _, key = seeded
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': key, 'alias': '我的测试群'},
+    )
+    assert resp.status_code == 200
+    data = resp.json()
+    assert data['chat']['name'] == '我的测试群'
+    assert data['chat']['alias'] == '我的测试群'
+    assert data['chat']['raw_name'] == '测试群'
+
+    chats = (await client.get('/botui/api/chats', headers=HEADERS)).json()['chats']
+    chat = next(c for c in chats if c['key'] == key)
+    assert chat['name'] == '我的测试群'
+
+
+async def test_rename_chat_can_be_cleared(client: AsyncClient, seeded):
+    _, key = seeded
+    await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': key, 'alias': '备注'},
+    )
+    await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': key, 'alias': ''},
+    )
+    chats = (await client.get('/botui/api/chats', headers=HEADERS)).json()['chats']
+    chat = next(c for c in chats if c['key'] == key)
+    assert chat['name'] == '测试群'
+    assert chat['alias'] is None
+
+
+async def test_rename_member_appears_in_members(client: AsyncClient, seeded):
+    _, key = seeded
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'member', 'chat': key, 'user_id': str(USER_ID), 'alias': '老板'},
+    )
+    assert resp.status_code == 200
+    assert resp.json()['member']['name'] == '老板'
+    assert resp.json()['member']['raw_name'] == '小明'
+
+    members = (
+        await client.get(f'/botui/api/members?chat={key}', headers=HEADERS)
+    ).json()['members']
+    entry = next(m for m in members if m['id'] == str(USER_ID))
+    assert entry['name'] == '老板'
+
+
+async def test_rename_bot_appears_in_bots(client: AsyncClient, botui, seeded):
+    store = botui._get_store()
+    await store.upsert_bot(BOT_ID, adapter='OneBot V11', name='机器人')
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'bot', 'self_id': BOT_ID, 'alias': '小助手'},
+    )
+    assert resp.status_code == 200
+    assert resp.json()['bot']['name'] == '小助手'
+
+    bots = (await client.get('/botui/api/bots', headers=HEADERS)).json()['bots']
+    bot = next(b for b in bots if b['self_id'] == BOT_ID)
+    assert bot['name'] == '小助手'
+
+
+async def test_rename_caps_alias_length(client: AsyncClient, seeded):
+    _, key = seeded
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': key, 'alias': 'x' * 200},
+    )
+    assert resp.status_code == 200
+    assert len(resp.json()['alias']) == 64
+
+
+async def test_rename_rejects_bad_requests(client: AsyncClient, seeded):
+    _, key = seeded
+    cases = [
+        {'kind': 'chat'},  # 缺 chat
+        {'kind': 'member', 'chat': key},  # 缺 user_id
+        {'kind': 'bot'},  # 缺 self_id
+        {'kind': 'nope', 'chat': key},  # 未知 kind
+    ]
+    for body in cases:
+        resp = await client.post('/botui/api/rename', headers=HEADERS, json=body)
+        assert resp.status_code == 400, body
+
+
+async def test_rename_unknown_target_is_404(client: AsyncClient, seeded):
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': '12345678:group_404', 'alias': 'x'},
+    )
+    assert resp.status_code == 404
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'bot', 'self_id': 'nope', 'alias': 'x'},
+    )
+    assert resp.status_code == 404
+
+
+async def test_rename_publishes_chat_event(client: AsyncClient, botui, seeded):
+    """改备注后要推送事件，其他打开的页面能同步刷新。"""
+    _, key = seeded
+    server = botui._get_server()
+    before = server.latest
+    resp = await client.post(
+        '/botui/api/rename',
+        headers=HEADERS,
+        json={'kind': 'chat', 'chat': key, 'alias': '新备注'},
+    )
+    assert resp.status_code == 200
+    # backlog 的 since 语义是「严格大于」，且 since<=0 视为刚打开页面不补发
+    events = server.backlog(before, server.latest, limit=50)
+    chat_events = [e for e in events if e['type'] == 'chat' and e['chat']]
+    assert any(e['chat']['name'] == '新备注' for e in chat_events)
+
+
 async def test_send_records_reply_with_quoted_summary(
     client: AsyncClient, botui, seeded
 ):

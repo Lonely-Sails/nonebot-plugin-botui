@@ -187,6 +187,10 @@ class WebUIServer:
     def publish_bot(self, bot: BotRecord) -> None:
         self._bus.publish_bot(bot)
 
+    def publish_chat(self, chat: ChatRecord) -> None:
+        """会话资料变化（如用户设置了备注）：推送更新给已打开的页面"""
+        self._bus.publish_chat(chat)
+
     # ── 挂载 ────────────────────────────────────────────────────────────
     def mount(self) -> bool:
         with self._lock:
