@@ -1100,9 +1100,6 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 }
 .seg-player.seg-video { max-height: 300px; }
 
-.chip.seg-forward { cursor: pointer; }
-.chip.seg-forward::before { content: "⤵"; font-size: 11px; opacity: 0.85; }
-
 /* ---------- 文件预览弹窗 ---------- */
 .file-viewer {
   position: fixed;
@@ -1194,24 +1191,90 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 }
 .file-media { display: block; width: 100%; max-height: 100%; margin: 0 auto; }
 
-/* ---------- 合并转发展开 ---------- */
-.forward-list { display: flex; flex-direction: column; gap: 12px; }
-.forward-hint { color: var(--faint); font-size: 13px; padding: 8px 0; }
-.forward-node {
-  border-left: 3px solid var(--accent);
-  border-radius: 0 8px 8px 0;
+/* ---------- 合并转发：可折叠的内嵌聊天记录 ----------
+   收起时只占一条标题栏，点开后原地展开成一条条小聊天记录（气泡样式），
+   不弹窗、也不把内容拼进当前气泡里。 */
+.fwd-card {
+  display: block;
+  margin: 3px 0 1px;
+  width: 264px;
+  max-width: 100%;
+  border: 1px solid var(--border);
+  border-radius: 10px;
   background: var(--panel-2);
-  padding: 7px 10px;
+  overflow: hidden;
+  text-align: left;
 }
-.forward-node-head {
+.fwd-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  border: 0;
+  background: var(--panel-3);
+  color: var(--text-dim);
+  font: inherit;
+  font-size: 12.5px;
+  text-align: left;
+  cursor: pointer;
+}
+.fwd-head:hover { filter: brightness(1.06); }
+.fwd-title {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.fwd-count { flex: none; font-size: 11px; color: var(--faint); }
+.fwd-caret {
+  flex: none;
+  width: 7px;
+  height: 7px;
+  margin-right: 2px;
+  border-right: 1.6px solid currentColor;
+  border-bottom: 1.6px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform 0.16s var(--ease);
+}
+.fwd-card.open .fwd-caret { transform: rotate(45deg); }
+.fwd-body {
+  padding: 9px 10px;
+  max-height: 340px;
+  overflow: auto;
+  border-top: 1px solid var(--border);
+}
+.fwd-node + .fwd-node { margin-top: 8px; }
+.fwd-node .fwd-node-meta {
   display: flex;
   align-items: baseline;
-  gap: 8px;
-  margin-bottom: 4px;
+  gap: 6px;
+  margin-bottom: 2px;
 }
-.forward-node-name { font-size: 12.5px; font-weight: 600; color: var(--accent-text); }
-.forward-node-time { font-size: 11px; color: var(--faint); }
-.forward-node-body .bubble { background: var(--panel); }
+.fwd-node-name { font-size: 11.5px; font-weight: 600; color: var(--accent-text); }
+.fwd-node-time { font-size: 10.5px; color: var(--faint); }
+/* 内层气泡固定用中性面板色 —— 选择器要压过 .msg.out .bubble，
+   否则「发出的转发」里每个节点的气泡都会被染成蓝色 */
+.fwd-card .fwd-node .bubble {
+  padding: 5px 9px;
+  font-size: 13px;
+  background: var(--panel);
+  color: var(--text);
+  border-color: var(--border);
+  box-shadow: none;
+}
+.fwd-card .fwd-node .bubble::after { display: none; }
+.fwd-hint { color: var(--faint); font-size: 12.5px; padding: 2px 0; }
+
+/* 发出的消息里卡片改用半透明浅色，跟蓝色气泡协调 */
+.msg.out .fwd-card { border-color: rgba(255, 255, 255, 0.24); }
+.msg.out .fwd-head { background: rgba(255, 255, 255, 0.16); color: rgba(255, 255, 255, 0.94); }
+.msg.out .fwd-count { color: rgba(255, 255, 255, 0.7); }
+.msg.out .fwd-body { border-top-color: rgba(255, 255, 255, 0.18); }
+.msg.out .fwd-node-name { color: #fff; }
+.msg.out .fwd-node-time { color: rgba(255, 255, 255, 0.66); }
 
 /* ---------- 右键菜单 ---------- */
 .ctx-menu {

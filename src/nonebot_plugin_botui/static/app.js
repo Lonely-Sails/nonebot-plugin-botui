@@ -69,7 +69,6 @@ const state = {
   needsScroll: false,       // 渲染后是否需要滚到底部
 
   fileSeq: 0,               // 文件预览请求序号（丢弃过期结果）
-  forwardSeq: 0,            // 合并转发展开请求序号
 
   unread: new Map(),        // 会话 key -> 未读数
   pending: new Map(),       // 会话 key -> 未读消息摘要
@@ -2101,14 +2100,108 @@ function formatBytes(value) {
   return (i === 0 ? String(size) : size.toFixed(1)) + ' ' + units[i];
 }
 
-/** 合并转发卡片：点击展开查看里面的消息 */
+/**
+ * 合并转发：可折叠的内嵌聊天记录。
+ *
+ * 默认收起，点标题栏原地展开成一条条小聊天记录（而不是弹窗、也不是把内容
+ * 拼进当前气泡里）。节点已经内联在段里就直接渲染；只有 id 的话在**首次展开**
+ * 时才去后端拉取，收起再展开不会重复请求。
+ */
 function buildForwardCard(seg) {
-  const count = Number(seg.count);
-  const label = '[合并转发]' + (Number.isFinite(count) && count > 0 ? '（' + count + ' 条）' : '');
-  const card = h('span', 'chip seg-forward clickable', label);
-  card.title = '点击展开查看转发内容';
-  if (hasText(seg.id)) card.dataset.forwardId = String(seg.id);
+  const card = h('div', 'fwd-card');
+  const id = hasText(seg.id) ? String(seg.id) : '';
+  const inline = Array.isArray(seg.nodes) ? seg.nodes : [];
+
+  const head = h('button', 'fwd-head');
+  head.type = 'button';
+  head.setAttribute('aria-expanded', 'false');
+  const title = h('span', 'fwd-title', '合并转发的聊天记录');
+  const count = h('span', 'fwd-count', forwardCountLabel(seg, inline));
+  head.appendChild(title);
+  head.appendChild(count);
+  head.appendChild(h('span', 'fwd-caret'));
+
+  const body = h('div', 'fwd-body');
+  body.hidden = true;
+  card.appendChild(head);
+  card.appendChild(body);
+
+  let loaded = false;
+  let loading = false;
+
+  const ensureLoaded = () => {
+    if (loaded || loading) return;
+    if (inline.length) { loaded = true; renderForwardNodes(body, inline); return; }
+    if (!id) {
+      loaded = true;
+      body.appendChild(h('div', 'fwd-hint', '这条合并转发没有可用的 ID，无法展开'));
+      return;
+    }
+    loading = true;
+    body.textContent = ''; // 清掉上次失败留下的提示，避免反复展开时重叠
+    const hint = h('div', 'fwd-hint', '正在展开…');
+    body.appendChild(hint);
+    (async () => {
+      try {
+        const query = 'id=' + encodeURIComponent(id)
+          + (state.current && state.current.key ? '&chat=' + encodeURIComponent(state.current.key) : '');
+        const data = await api('/forward?' + query);
+        // 卡片可能已被移除（切换会话/重绘），丢弃过期结果即可；
+        // 收起不会中断请求，结果照样写进隐藏的 body，下次展开是瞬时的
+        if (!card.isConnected) return;
+        hint.remove();
+        const list = data && Array.isArray(data.nodes) ? data.nodes : [];
+        if (!list.length) { loaded = true; body.appendChild(h('div', 'fwd-hint', '这条合并转发是空的')); return; }
+        loaded = true;
+        count.textContent = list.length + ' 条消息';
+        renderForwardNodes(body, list);
+      } catch (err) {
+        if (!card.isConnected) return;
+        hint.remove();
+        const message = (err && err.message) ? err.message : '请求失败';
+        body.appendChild(h('div', 'fwd-hint', message.indexOf('无法展开') === 0 ? message : '无法展开：' + message));
+      } finally {
+        loading = false;
+      }
+    })();
+  };
+
+  head.addEventListener('click', () => {
+    const open = body.hidden;
+    card.classList.toggle('open', open);
+    head.setAttribute('aria-expanded', open ? 'true' : 'false');
+    body.hidden = !open;
+    if (open) ensureLoaded();
+  });
+
   return card;
+}
+
+/** 合并转发标题栏右边的条数：优先用内联节点数，其次用段里记录的 count */
+function forwardCountLabel(seg, inline) {
+  const n = inline.length || Number(seg.count);
+  return Number.isFinite(n) && n > 0 ? n + ' 条消息' : '聊天记录';
+}
+
+/** 渲染合并转发里的每条节点（沿用普通消息的气泡，图片/文件展开后仍可点开） */
+function renderForwardNodes(box, nodes) {
+  nodes.forEach((node) => {
+    const row = h('div', 'fwd-node');
+    const meta = h('div', 'fwd-node-meta');
+    const name = hasText(node.name) ? String(node.name)
+      : (hasText(node.user_id) ? String(node.user_id) : '未知');
+    meta.appendChild(h('span', 'fwd-node-name', name));
+    const t = parseTime(node.time);
+    if (t !== null) {
+      const time = h('span', 'fwd-node-time', fullTime(t));
+      time.title = fullTime(t);
+      meta.appendChild(time);
+    }
+    row.appendChild(meta);
+    const segs = Array.isArray(node.segments) ? node.segments : [];
+    row.appendChild(buildBubble(segs.length ? segs : [{ type: 'text', text: '[空消息]' }]));
+    box.appendChild(row);
+  });
 }
 
 function externalLink(href, text) {
@@ -2893,62 +2986,6 @@ async function openFilePreview(seg) {
   el.fileViewerBody.appendChild(media);
 }
 
-/** 展开合并转发：优先用记录里内联的节点，否则请后端调适配器接口 */
-function openForwardPreview(seg) {
-  const id = hasText(seg.id) ? String(seg.id) : '';
-  if (!id) { toast('这条合并转发没有可用的 ID，无法展开', true); return; }
-  const box = h('div', 'forward-list');
-  const nodes = Array.isArray(seg.nodes) ? seg.nodes : [];
-  if (nodes.length) {
-    renderForwardNodes(box, nodes);
-    openFileViewer('合并转发（' + nodes.length + ' 条）', '');
-    el.fileViewerBody.appendChild(box);
-    return;
-  }
-
-  const seq = ++state.forwardSeq;
-  const loading = h('div', 'forward-hint', '正在展开…');
-  box.appendChild(loading);
-  openFileViewer('合并转发', '');
-  el.fileViewerBody.appendChild(box);
-  (async () => {
-    try {
-      const query = 'id=' + encodeURIComponent(id)
-        + (state.current && state.current.key ? '&chat=' + encodeURIComponent(state.current.key) : '');
-      const data = await api('/forward?' + query);
-      if (seq !== state.forwardSeq || el.fileViewer.hidden) return;
-      box.textContent = '';
-      const list = data && Array.isArray(data.nodes) ? data.nodes : [];
-      if (!list.length) {
-        box.appendChild(emptyState('没有内容', '这条合并转发是空的'));
-        return;
-      }
-      el.fileViewerTitle.textContent = '合并转发（' + list.length + ' 条）';
-      renderForwardNodes(box, list);
-    } catch (err) {
-      if (seq !== state.forwardSeq) return;
-      box.textContent = '';
-      box.appendChild(emptyState('无法展开', (err && err.message) ? err.message : '请求失败'));
-    }
-  })();
-}
-
-function renderForwardNodes(box, nodes) {
-  nodes.forEach((node) => {
-    const row = h('div', 'forward-node');
-    const head = h('div', 'forward-node-head');
-    head.appendChild(h('span', 'forward-node-name', hasText(node.name) ? String(node.name) : (hasText(node.user_id) ? String(node.user_id) : '未知')));
-    const t = parseTime(node.time);
-    if (t !== null) head.appendChild(h('span', 'forward-node-time', fullTime(t)));
-    row.appendChild(head);
-    const segs = Array.isArray(node.segments) ? node.segments : [];
-    const body = h('div', 'forward-node-body');
-    body.appendChild(buildBubble(segs.length ? segs : [{ type: 'text', text: '[空消息]' }]));
-    row.appendChild(body);
-    box.appendChild(row);
-  });
-}
-
 function openCtxMenu(x, y, msg) {
   state.ctxMsg = msg;
   const menu = el.ctxMenu;
@@ -3069,17 +3106,6 @@ function removeMessage(id) {
 function cssEscape(value) {
   if (window.CSS && typeof window.CSS.escape === 'function') return window.CSS.escape(String(value));
   return String(value).replace(/["\\]/g, '\\$&');
-}
-
-/** 在一条已加载的消息里找出指定 id 的合并转发段（拿 segment 上的内联节点） */
-function findForwardSeg(msg, forwardId) {
-  if (!msg || !Array.isArray(msg.segments)) return null;
-  const wanted = String(forwardId || '');
-  for (let i = 0; i < msg.segments.length; i++) {
-    const seg = msg.segments[i];
-    if (seg && seg.type === 'forward' && String(seg.id || '') === wanted) return seg;
-  }
-  return null;
 }
 
 /** 取出消息里第一个带可用链接的文件段（用于右键菜单的“预览文件”） */
@@ -3585,14 +3611,6 @@ function bindEvents() {
     const replyChip = closestFrom(ev.target, '[data-reply-id]');
     if (replyChip) {
       jumpToMessage(replyChip.dataset.replyId);
-      return;
-    }
-    const forwardChip = closestFrom(ev.target, '[data-forward-id]');
-    if (forwardChip) {
-      const row = closestFrom(forwardChip, '.msg');
-      const msg = row && row.dataset.id ? state.msgMap.get(String(row.dataset.id)) : null;
-      const seg = msg ? findForwardSeg(msg, forwardChip.dataset.forwardId) : null;
-      openForwardPreview(seg || { type: 'forward', id: forwardChip.dataset.forwardId });
       return;
     }
     const copyChip = closestFrom(ev.target, '[data-copy]');
