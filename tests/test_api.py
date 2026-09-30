@@ -81,9 +81,17 @@ async def test_chats_accepts_token_header(client: AsyncClient):
     assert 'chats' in resp.json()
 
 
-async def test_chats_accepts_token_query(client: AsyncClient):
+async def test_token_query_is_limited_to_read_paths(client: AsyncClient):
+    """``?token=`` 只对只读取回接口放行，数据接口不再接受它。
+
+    令牌出现在 URL 里容易被反向代理访问日志、浏览器历史记下来，所以收紧成
+    「只给浏览器带不上自定义头的路径用」（图片/文件/导出/WebSocket）。
+    """
     resp = await client.get(f'/botui/api/chats?token={TOKEN}')
-    assert resp.status_code == 200
+    assert resp.status_code == 401
+    resp = await client.get(f'/botui/media?u=ftp://nope&token={TOKEN}')
+    # 通过了鉴权，只是链接协议不被接受（不是 401）
+    assert resp.status_code == 400
 
 
 async def test_chats_accepts_bearer_token(client: AsyncClient):
@@ -207,8 +215,13 @@ async def test_meta(client: AsyncClient, seeded):
 
 
 async def test_health(client: AsyncClient, seeded):
-    data = (await client.get('/botui/api/health')).json()
+    data = (await client.get('/botui/api/health', headers=HEADERS)).json()
     assert data['ok'] is True
+
+
+async def test_health_requires_token(client: AsyncClient):
+    """健康检查不能开成匿名接口：否则仅本机限制之外还能拿到机器人清单。"""
+    assert (await client.get('/botui/api/health')).status_code == 401
 
 
 # ── 会话与消息 ──────────────────────────────────────────────────────────
@@ -1009,6 +1022,26 @@ async def test_upload_rejects_too_large(
     assert resp.status_code == 413
 
 
+async def test_upload_rejects_oversized_declared_length_without_reading(
+    client: AsyncClient, seeded, monkeypatch: pytest.MonkeyPatch
+):
+    """先看 Content-Length 就能拒绝，不必先把整个 body 读进内存。
+
+    这是「内存放大」的修复点：以前是 ``await request.body()`` 之后再比大小，
+    超限判断形同虚设。这里用不带 body 的请求 + 伪造的 Content-Length 验证
+    分支确实走的是「声明长度」那条路（真读 body 会因缺内容而不同）。
+    """
+    from src.nonebot_plugin_botui import api
+
+    monkeypatch.setattr(api.cfg, 'botui_media_file_max_bytes', 8)
+    resp = await client.post(
+        '/botui/api/upload?name=a.bin',
+        headers={**HEADERS, 'Content-Length': '1048576'},
+        content=b'x',
+    )
+    assert resp.status_code == 413
+
+
 async def test_upload_then_fetch_and_delete(client: AsyncClient, botui, seeded):
     """上传 → 取回 → 删除的完整链路。"""
     up = await client.post(
@@ -1259,12 +1292,12 @@ async def test_media_blocked_reason_covers_aliases():
     assert await _blocked_reason('http://93.184.216.34/x') == ''
 
 
-@pytest.mark.parametrize('path', ['/botui/api/meta', '/botui/api/health'])
+@pytest.mark.parametrize('path', ['/botui/api/meta'])
 async def test_endpoints_do_not_require_token(client: AsyncClient, path: str):
-    """meta/health 不需要令牌：前端拿到令牌之前就要靠它们判断该不该弹令牌框。
+    """``/api/meta`` 不需要令牌：前端拿到令牌之前就要靠它判断该不该弹令牌框。
 
-    注意这两个接口对匿名请求只返回引导性字段，数据库路径、机器人清单这类
-    环境细节要鉴权后才给（见 test_meta_hides_environment_details_without_token）。
+    注意匿名请求只返回引导性字段，数据库路径、机器人清单这类环境细节要鉴权后
+    才给（见 test_meta_hides_environment_details_without_token）。
     """
     assert (await client.get(path)).status_code == 200
 
@@ -1324,6 +1357,75 @@ async def test_changing_link_host_does_not_weaken_gate(botui, monkeypatch):
     for host in ('127.0.0.1', '192.168.1.5', '', '0.0.0.0', '*'):
         monkeypatch.setattr(cfg, 'botui_host', host, raising=False)
         assert botui.api._client_allowed(request) is False, host
+
+
+# ── Host 白名单（BOTUI_ALLOWED_HOSTS，挡 DNS rebinding）───────────────────
+def _conn(host: str = '', host_header: str = ''):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        client=SimpleNamespace(host=host) if host else None,
+        headers={'host': host_header} if host_header else {},
+    )
+
+
+async def test_host_header_not_checked_until_configured(botui, monkeypatch):
+    """未配置 BOTUI_ALLOWED_HOSTS 时不校验 Host：用主机名访问本机也能用。
+
+    这一步只是纵深防御，默认开启令牌时 DNS rebinding 也拿不到数据，不该为了
+    它牺牲可用性（``http://my-nas:8080`` 会被误伤）。
+    """
+    monkeypatch.setattr(botui.cfg, 'botui_allowed_hosts', (), raising=False)
+    assert botui.api._client_allowed(_conn('127.0.0.1', 'my-nas:8080')) is True
+
+
+async def test_host_whitelist_blocks_rebinding(botui, monkeypatch):
+    """配置白名单后：来源是环回但 Host 不是允许的域名 → 拒绝。"""
+    monkeypatch.setattr(
+        botui.cfg, 'botui_allowed_hosts', ('bot.example.com',), raising=False
+    )
+    # 域名对得上（带端口也要能剥掉）
+    assert botui.api._client_allowed(_conn('127.0.0.1', 'bot.example.com:8080'))
+    # 本机主机名始终放行
+    assert botui.api._client_allowed(_conn('127.0.0.1', 'localhost:8080'))
+    assert botui.api._client_allowed(_conn('::1', '[::1]:8080'))
+    # DNS rebinding：来源是环回，但 Host 是攻击者域名
+    assert botui.api._client_allowed(_conn('127.0.0.1', 'evil.example')) is False
+
+
+# ── 鉴权失败限速 ────────────────────────────────────────────────────────
+async def test_repeated_auth_failures_are_throttled(client: AsyncClient):
+    """连续用错令牌会让该来源短时 429，避免被无成本地反复猜。"""
+    from src.nonebot_plugin_botui import api
+
+    api._auth_throttle.clear()
+    try:
+        statuses = [
+            (
+                await client.get('/botui/api/chats', headers={'X-BotUI-Token': 'nope'})
+            ).status_code
+            for _ in range(api._AUTH_FAIL_LIMIT + 2)
+        ]
+        assert statuses[0] == 401
+        assert statuses[-1] == 429
+    finally:
+        api._auth_throttle.clear()
+
+
+# ── 安全响应头 ──────────────────────────────────────────────────────────
+async def test_security_headers_are_added(client: AsyncClient):
+    """BotUI 路由下统一带 nosniff / 防点击劫持 / no-referrer 与 CSP。"""
+    resp = await client.get('/botui/api/meta')
+    assert resp.headers['x-content-type-options'] == 'nosniff'
+    assert resp.headers['x-frame-options'] == 'DENY'
+    assert resp.headers['referrer-policy'] == 'no-referrer'
+    assert "frame-ancestors 'none'" in resp.headers['content-security-policy']
+
+
+async def test_security_headers_do_not_touch_other_routes(client: AsyncClient):
+    """只作用于 BotUI 路由，别把宿主/其它插件的响应头也改了。"""
+    resp = await client.get('/not-botui/nope')
+    assert 'x-frame-options' not in resp.headers
 
 
 async def test_meta_hides_environment_details_without_token(client: AsyncClient):

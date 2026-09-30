@@ -101,11 +101,102 @@ def auth_required() -> bool:
 
 
 # ── 鉴权 ────────────────────────────────────────────────────────────────
+#: 允许用 ``?token=`` 传令牌的**路由内相对路径**（挂载前缀由
+#: :func:`_relative_path` 剥掉）。两类场景必须走 query：``<img>`` /
+#: ``<a download>`` 这类浏览器自发请求带不上自定义头；WebSocket 的
+#: ``new WebSocket(url)`` 也**无法设置请求头**。其余接口（含所有写接口）只认
+#: ``X-BotUI-Token``，免得令牌被反向代理日志、浏览器历史或子资源请求带出去。
+_QUERY_TOKEN_PATHS = frozenset(
+    {'/media', '/api/media', '/api/file', '/api/preview', '/api/export', '/api/ws'}
+)
+
+#: 始终允许的 ``Host``（本机名，与来源限制配套）
+_LOCAL_HOSTS = frozenset({'localhost', '127.0.0.1', '::1', '0.0.0.0'})
+
+#: 鉴权失败限速：同一来源在窗口内失败到这个次数后一律 429
+_AUTH_FAIL_LIMIT = 10
+_AUTH_WINDOW = 60.0
+
+#: 内存里最多跟踪多少条一次性记录（鉴权失败窗口与发送限流各留一份额度）
+_TRACK_LIMIT = 1024
+
+
+class _AuthThrottle:
+    """按来源记录鉴权失败时间戳的滑动窗口。
+
+    同一来源在 :data:`_AUTH_WINDOW` 秒内失败到 :data:`_AUTH_FAIL_LIMIT` 次后，
+    后续请求一律 429 —— 令牌熵足够高，这层只是不给「无成本反复猜」留余地。
+    过期记录在读写时顺带清掉，字典本身再留一个条数上限。
+    """
+
+    def __init__(
+        self,
+        limit: int = _AUTH_FAIL_LIMIT,
+        window: float = _AUTH_WINDOW,
+        max_keys: int = _TRACK_LIMIT,
+    ) -> None:
+        self._limit = limit
+        self._window = window
+        self._max_keys = max_keys
+        self._fails: dict[str, list[float]] = {}
+
+    def exceeded(self, key: str) -> bool:
+        """窗口内的失败次数是否已达上限。"""
+        return len(self._fresh(key, time.time())) >= self._limit
+
+    def record(self, key: str) -> None:
+        """记一次失败。"""
+        now = time.time()
+        self._fails[key] = [*self._fresh(key, now), now]
+        if len(self._fails) > self._max_keys:
+            self._fails.pop(next(iter(self._fails)), None)
+
+    def clear(self) -> None:
+        self._fails.clear()
+
+    def _fresh(self, key: str, now: float) -> list[float]:
+        """窗口内的失败时间戳；顺手丢掉过期的（该来源没剩记录就移除键）。"""
+        stamps = [t for t in self._fails.get(key, ()) if now - t < self._window]
+        if stamps:
+            self._fails[key] = stamps
+        else:
+            self._fails.pop(key, None)
+        return stamps
+
+
+_auth_throttle = _AuthThrottle()
+
+
+def _client_host(conn: HTTPConnection) -> str:
+    """请求来源地址；拿不到时返回 ``-``（既不匹配环回，也不会与真实地址撞车）。"""
+    return (conn.client.host if conn.client else '') or '-'
+
+
+def _relative_path(path: str) -> str:
+    """剥掉挂载前缀，得到路由内路径（``/botui/api/x`` → ``/api/x``）。
+
+    路由以 ``include_router(prefix=route)`` 挂载，``request.url.path`` 一定带着
+    前缀；而地址白名单按路由内路径书写，比对前必须先剥掉。
+    """
+    route = str(cfg.botui_route or '').rstrip('/')
+    return path[len(route) :] if route and path.startswith(route) else path
+
+
+def _query_token_ok(path: str) -> bool:
+    """该路径是否允许用 ``?token=`` 鉴权。"""
+    relative = _relative_path(path)
+    return any(
+        relative == p or relative.startswith(f'{p}/') for p in _QUERY_TOKEN_PATHS
+    )
+
+
 def _token_ok(conn: HTTPConnection) -> bool:
     """校验令牌。
 
-    前端只走 ``X-BotUI-Token`` 请求头；另外两种是为「curl / 直接点链接」留的：
-    地址栏里带 ``?token=``，以及 ``Authorization: Bearer``。
+    前端只走 ``X-BotUI-Token`` 请求头；地址栏里的 ``?token=`` 与
+    ``Authorization: Bearer`` 是为「curl / 直接点链接」留的便利，其中
+    ``?token=`` 只对 :data:`_QUERY_TOKEN_PATHS` 里的只读路径放行（否则令牌容易
+    被反向代理日志、浏览器历史或第三方子资源请求记录走）。
 
     参数类型是 ``HTTPConnection``：``Request`` 与 ``WebSocket`` 都是它的子类，
     校验逻辑（headers / query_params / client）两边完全一致。
@@ -114,12 +205,13 @@ def _token_ok(conn: HTTPConnection) -> bool:
         return True
     if not _token:
         return False
-    supplied = (
+    supplied = [
         conn.headers.get('x-botui-token', ''),
         conn.headers.get('authorization', '').removeprefix('Bearer ').strip(),
-        conn.query_params.get('token', ''),
-    )
-    return any(secrets.compare_digest(value, _token) for value in supplied)
+    ]
+    if _query_token_ok(conn.url.path):
+        supplied.append(conn.query_params.get('token', ''))
+    return any(secrets.compare_digest(value, _token) for value in supplied if value)
 
 
 def _is_loopback(host: str) -> bool:
@@ -142,17 +234,51 @@ def _is_loopback(host: str) -> bool:
     return ip.is_loopback
 
 
+def _host_only(header: str) -> str:
+    """从 ``Host`` 头里取出主机名（去掉端口与 IPv6 的方括号）。"""
+    text = header.strip().lower()
+    if text.startswith('['):  # [::1] 或 [::1]:8080
+        return text[1:].split(']', 1)[0]
+    return text.rsplit(':', 1)[0] if ':' in text else text
+
+
+def _host_allowed(conn: HTTPConnection) -> bool:
+    """校验请求的 ``Host`` 头（用于挡 DNS rebinding，**按需启用**）。
+
+    ``BOTUI_ALLOWED_HOSTS`` 为空时**不校验** —— 否则用主机名访问本机
+    （如 ``http://my-nas:8080``）都会被挡住，而默认开启令牌鉴权时 DNS
+    rebinding 也拿不到数据。把它当纵深项：走域名 / 反向代理部署时，把域名写进
+    ``BOTUI_ALLOWED_HOSTS`` 即启用白名单，本机主机名与环回 IP 始终允许。
+    """
+    if cfg.botui_allow_remote:
+        return True
+    allowed = {
+        str(item).strip().strip('[]').lower() for item in cfg.botui_allowed_hosts
+    }
+    if not allowed:
+        return True
+    header = (conn.headers.get('host') or '').strip().lower()
+    if not header:
+        return True
+    host = _host_only(header)
+    return host in _LOCAL_HOSTS or _is_loopback(host) or host in allowed
+
+
 def _client_allowed(conn: HTTPConnection) -> bool:
     """是否允许该来源访问。
 
     默认只允许本机；要开放给外部必须显式设置 ``BOTUI_ALLOW_REMOTE=true``。
     这里刻意**不**根据 ``botui_host`` 推断：那个配置只用来拼提示链接，
     如果顺带决定安全策略，把链接改成局域网地址就会意外放开访问。
+
+    仅本机模式下，若配置了 ``BOTUI_ALLOWED_HOSTS`` 还会校验 ``Host``
+    （见 :func:`_host_allowed`），用于挡 DNS rebinding。
     """
+    if not _host_allowed(conn):
+        return False
     if cfg.botui_allow_remote:
         return True
-    client = (conn.client.host if conn.client else '') or ''
-    return _is_loopback(client)
+    return _is_loopback(_client_host(conn))
 
 
 def _guard(request: Request) -> None:
@@ -163,7 +289,11 @@ def _guard(request: Request) -> None:
                 'BotUI 仅允许本机访问（如确需远程访问，请设置 BOTUI_ALLOW_REMOTE=true）'
             ),
         )
+    client = _client_host(request)
+    if _auth_throttle.exceeded(client):
+        raise HTTPException(status_code=429, detail='鉴权失败次数过多，请稍后再试')
     if not _token_ok(request):
+        _auth_throttle.record(client)
         raise HTTPException(status_code=401, detail='BotUI 令牌无效或缺失')
 
 
@@ -302,6 +432,7 @@ async def get_meta(request: Request) -> dict[str, Any]:
         },
         'file_preview': bool(cfg.botui_file_preview),
         'file_max_bytes': int(cfg.botui_file_max_bytes),
+        'robots_tag': 'noindex, nofollow',
         'upload_enabled': bool(cfg.botui_media_enabled and cfg.botui_write_enabled),
         'upload_max_bytes': int(
             cfg.botui_media_file_max_bytes or cfg.botui_file_max_bytes
@@ -344,7 +475,13 @@ async def get_bots(request: Request) -> dict[str, Any]:
 
 
 @router.get('/api/health')
-async def get_health() -> dict[str, Any]:
+async def get_health(request: Request) -> dict[str, Any]:
+    """健康检查。
+
+    和别的接口一样走 ``_guard``：不加的话它会在 ``BOTUI_ALLOW_REMOTE=false`` 下
+    也能访问，泄露机器人 ``self_id`` 清单与在线状态。
+    """
+    _guard(request)
     store = _store
     return {
         'ok': bool(store and store.ready),
@@ -436,7 +573,7 @@ async def post_rename(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f'请求体不是合法 JSON：{e}') from e
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON') from e
 
     kind = str(payload.get('kind') or '').strip()
     alias = _clean_alias(payload.get('alias'))
@@ -614,6 +751,8 @@ async def _throttle(key: str) -> None:
         if wait > 5:  # pragma: no cover - 配置异常时避免长时间挂起
             raise HTTPException(status_code=429, detail='发送过于频繁，请稍后再试')
         await asyncio.sleep(wait)
+    if len(_last_send) >= _TRACK_LIMIT:
+        _last_send.pop(next(iter(_last_send)), None)
     _last_send[key] = time.time()
 
 
@@ -622,18 +761,42 @@ async def _throttle(key: str) -> None:
 _ANY_ID = re.compile(r'^[A-Za-z0-9_-]{6,80}$')
 
 
-async def _read_uploaded(request: Request) -> tuple[bytes, str, str]:
-    """从上传请求里取出 ``(字节, 文件名, 类型)``。
+async def _read_uploaded(request: Request, limit: int) -> tuple[bytes, str, str]:
+    """从上传请求里取出 ``(字节, 文件名, 类型)``，并保证不超过 ``limit`` 字节。
 
     刻意**不**解析 multipart/form-data：那需要额外依赖 python-multipart，
     而前端完全不必装成表单 —— 直接把文件字节放在请求体里、把文件名与类型放进
     查询参数（``?name=`` / ``?type=``）即可。请求体就是一段裸字节流，读取、
     限制大小、测试都简单得多（curl 用 ``--data-binary @a.png`` 即可）。
+
+    先看 ``Content-Length`` 再**分块**读取：绝不能 ``await request.body()``
+    一把梭 —— 那会先把整个 body 缓冲进内存、超限判断就形同虚设，拿一个
+    ``Content-Length: 4GB`` 的请求就能把进程内存打爆。超限时抛 413。
     """
-    data = await request.body()
+    _raise_if_oversized(request.headers.get('content-length'), limit)
+    chunks: list[bytes] = []
+    total = 0
+    async for chunk in request.stream():
+        if not chunk:
+            continue
+        total += len(chunk)
+        _raise_if_oversized(total, limit)
+        chunks.append(chunk)
     name = request.query_params.get('name', '')
     mime = request.query_params.get('type', '')
-    return data, name, mime
+    return b''.join(chunks), name, mime
+
+
+def _raise_if_oversized(size: int | str | None, limit: int) -> None:
+    """体积超限时抛 413。``limit <= 0`` 视为不限制；``size`` 可以是
+    ``Content-Length`` 或已读字节数（非数字则忽略）。"""
+    if limit <= 0:
+        return
+    value = int(size) if isinstance(size, str) and size.isdigit() else size
+    if isinstance(value, int) and value > limit:
+        raise HTTPException(
+            status_code=413, detail=f'文件过大（上限 {limit // 1048576} MB）'
+        )
 
 
 @router.post('/api/upload')
@@ -655,17 +818,11 @@ async def post_upload(request: Request) -> dict[str, Any]:
     if _media is None:  # pragma: no cover - setup 一定会注入
         raise HTTPException(status_code=503, detail='BotUI 媒体库尚未就绪')
 
-    data, name, mime = await _read_uploaded(request)
+    data, name, mime = await _read_uploaded(
+        request, int(cfg.botui_media_file_max_bytes)
+    )
     if not data:
         raise HTTPException(status_code=400, detail='没有收到文件内容')
-    limit = int(cfg.botui_media_file_max_bytes)
-    if limit > 0 and len(data) > limit:
-        raise HTTPException(
-            status_code=413,
-            detail=(
-                f'文件过大（{len(data) / 1048576:.1f} MB，上限 {limit // 1048576} MB）'
-            ),
-        )
     record = await _media.stage(data, name=name, mime=mime)
     if record is None:
         raise HTTPException(status_code=413, detail='附件过大或媒体库未启用')
@@ -840,7 +997,7 @@ async def post_send(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f'请求体不是合法 JSON：{e}') from e
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON') from e
 
     key = str(payload.get('chat') or '').strip()
     text = str(payload.get('text') or '')
@@ -901,7 +1058,7 @@ async def post_send(request: Request) -> dict[str, Any]:
         receipt = await _send_via_bot(bot, chat, at_list, text, reply_to, extra)
     except Exception as e:
         logger.opt(exception=True).warning(f'BotUI failed to send message: {e}')
-        raise HTTPException(status_code=502, detail=f'发送失败：{e}') from e
+        raise HTTPException(status_code=502, detail='发送失败，请查看服务端日志') from e
     finally:
         # 发送用的临时文件名副本（见 _send_path）只在发送期间需要
         for directory in cleanup_dirs:
@@ -998,7 +1155,7 @@ async def post_recall(request: Request) -> dict[str, Any]:
     try:
         payload = await request.json()
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f'请求体不是合法 JSON：{e}') from e
+        raise HTTPException(status_code=400, detail='请求体不是合法 JSON') from e
 
     row_id = payload.get('id')
     if row_id in (None, ''):
@@ -1039,7 +1196,7 @@ async def post_recall(request: Request) -> dict[str, Any]:
         await exporter.recall(record.message_id, bot, _make_target(chat))
     except Exception as e:
         logger.opt(exception=True).warning(f'BotUI failed to recall message: {e}')
-        raise HTTPException(status_code=502, detail=f'撤回失败：{e}') from e
+        raise HTTPException(status_code=502, detail='撤回失败，请查看服务端日志') from e
 
     await store.mark_recalled(record.row_id)
     if _server is not None:
@@ -1315,7 +1472,7 @@ async def get_file(
         raise HTTPException(status_code=403, detail=str(e)) from e
     except Exception as e:
         logger.opt(exception=True).warning(f'BotUI failed to open file: {e}')
-        raise HTTPException(status_code=502, detail=f'获取文件失败：{e}') from e
+        raise HTTPException(status_code=502, detail='获取文件失败') from e
 
     max_bytes = int(cfg.botui_file_max_bytes)
     length = head.headers.get('content-length')

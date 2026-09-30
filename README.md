@@ -91,6 +91,7 @@ plugins = ["nonebot_plugin_botui"]
 | `BOTUI_ROUTE` | `str` | `/botui` | WebUI 挂载路径，不以 `/` 开头会自动补上 |
 | `BOTUI_HOST` | `str` | `127.0.0.1` | 提示链接里使用的主机名（**只影响链接显示**，不改变安全策略） |
 | `BOTUI_ALLOW_REMOTE` | `bool` | `false` | 是否允许非本机来源访问；开启前请确认令牌鉴权已启用（见「安全提示」） |
+| `BOTUI_ALLOWED_HOSTS` | `tuple[str, ...]` | `()` | 允许的 `Host` 头白名单，**留空则不校验**；走域名（反向代理）访问时填上域名即启用，用于挡 DNS rebinding |
 | `BOTUI_AUTH` | `bool` | `true` | 是否启用令牌鉴权（强烈建议保持开启） |
 | `BOTUI_TOKEN` | `str` | 空 | 访问令牌；留空则自动生成并保存到数据目录的 `token.txt` |
 | `BOTUI_CAPTURE_RECEIVED` | `bool` | `true` | 是否记录机器人收到的消息 |
@@ -173,7 +174,10 @@ LOCALSTORE_PLUGIN_DATA_DIR={"nonebot_plugin_botui": "/srv/botui/data"}
 ## 🔐 安全提示
 
 - **默认开启令牌鉴权**（`BOTUI_AUTH=true`）。令牌要么由 `BOTUI_TOKEN` 指定，要么自动生成 24 字节随机串写入数据目录的 `token.txt`（权限 `0600`）。请勿把令牌或 `token.txt` 泄露出去。
+- **令牌优先走请求头**。普通接口一律用 `X-BotUI-Token`；地址栏里的 `?token=` 只对**浏览器无法带自定义头**的路径放行（`/media`、`/api/media`、`/api/file`、`/api/preview`、`/api/export` 与 WebSocket `/api/ws`），写接口一律不接受它 —— 这样令牌不容易被反向代理访问日志、浏览器历史或第三方子资源请求带出去。鉴权失败次数过多会短时返回 429。
 - **默认只允许本机访问**。服务端会拒绝非本机来源的请求（返回 403）。判断来源用的是 `ipaddress` 的 loopback 判定，所以 `127.0.0.1`、`127.0.0.2`、`::1`、`::ffff:127.0.0.1`、`localhost` 都算本机。要开放给外部，需要显式设置 **`BOTUI_ALLOW_REMOTE=true`**。
+- **`Host` 头白名单（挡 DNS rebinding，按需启用）**。`BOTUI_ALLOWED_HOSTS` **留空时不做任何校验**（默认），这样用主机名访问本机（如 `http://my-nas:8080`）不会被打回。走**域名**（反向代理）部署时把域名写进去即启用白名单：本机主机名（`localhost`、`127.0.0.1`、`[::1]`）始终允许，其余 `Host` 一律拒绝。这样即便攻击者用「先解析到自己的服务器、再改解析到 `127.0.0.1`」的手法让来源变成环回，也会因为 `Host` 不对而被拒。
+- **响应头加固**。BotUI 路由下的响应都会带上 `X-Content-Type-Options: nosniff`、`X-Frame-Options: DENY`、`Referrer-Policy: no-referrer` 与 `frame-ancestors 'none'` 的 CSP。`nosniff` 尤其重要：`/api/file` 会按上游给的 `content-type` 内联返回文件，没有它时浏览器可能对内容做嗅探。此外 `/api/meta` 会返回 `robots_tag`，前端据此插入 `<meta name="robots" content="noindex, nofollow">`，避免被搜索引擎收录。
 - **`BOTUI_HOST` 只管链接显示**。它决定启动日志里给出的主机名（比如你走反向代理，就填域名），**不会**改变来源限制。这样把链接改成局域网地址或域名都不会意外放开访问；反过来也不会因为填了域名就把自己锁在外面。
 - 若同时开启 `BOTUI_ALLOW_REMOTE=true` 与 `BOTUI_AUTH=false`，启动时会打印一条醒目警告 —— 这是「任何人只要能访问该地址就能查看全部记录并冒充机器人」的状态。
 - **链接里带的是单一密钥**。`?token=xxx` 就是全部凭据：谁能拿到链接，谁就能查看全部聊天记录并以机器人的身份发消息、撤回消息。地址只出现在**服务端控制台日志**里（不会发到任何聊天窗口），请自行保管好日志输出。

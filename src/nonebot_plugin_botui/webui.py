@@ -216,6 +216,10 @@ class WebUIServer:
             if app.middleware_stack is not None:
                 app.middleware_stack = app.build_middleware_stack()
 
+            # 最后在最外层包一层安全头中间件。顺序很重要：必须在重建栈之后，
+            # 这样包住的是最终生效的那一层。
+            _install_security_headers(app, self.route)
+
             self.mounted = True
             port = nonebot.get_driver().config.port
             self.url = f'http://{cfg.botui_host}:{port}{self.route}/'
@@ -326,3 +330,57 @@ async def _delegate(handler: Any, request: Any, exc: Exception) -> Any:
     if inspect.isawaitable(result):
         return await result
     return result
+
+
+#: BotUI 路由统一附加的响应头。
+#: - ``nosniff`` 最关键：``/api/file`` 会把**上游给的 content-type** 内联返回，
+#:   没有它，浏览器有可能把用户可控的字节当 HTML/脚本渲染；
+#: - ``X-Frame-Options`` 防点击劫持；``no-referrer`` 防 Referer 外带到上游。
+_SECURITY_HEADERS: tuple[tuple[bytes, bytes], ...] = (
+    (b'x-content-type-options', b'nosniff'),
+    (b'x-frame-options', b'DENY'),
+    (b'referrer-policy', b'no-referrer'),
+    (b'content-security-policy', b"frame-ancestors 'none'; base-uri 'none'"),
+)
+
+
+class _SecurityHeaders:
+    """给 BotUI 路由的 HTTP 响应补上安全头的最薄 ASGI 中间件。
+
+    刻意**不用** ``BaseHTTPMiddleware``：它会额外包一层任务、拦所有请求，和
+    WebSocket / aiosqlite 的连接语义容易产生意外交互；这里只需在响应开始时改写
+    ``headers``。``websocket`` 的握手响应头没有同样的意义，直接放行。
+    """
+
+    def __init__(self, app: Any, route_prefix: str) -> None:
+        self.app = app
+        self.route_prefix = route_prefix
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get('type') != 'http' or not str(scope.get('path', '')).startswith(
+            self.route_prefix
+        ):
+            await self.app(scope, receive, send)
+            return
+
+        async def _send(message: dict[str, Any]) -> None:
+            if message.get('type') == 'http.response.start':
+                headers = list(message.get('headers') or [])
+                existing = {key.lower() for key, _ in headers}
+                headers.extend(h for h in _SECURITY_HEADERS if h[0] not in existing)
+                message = {**message, 'headers': headers}
+            await send(message)
+
+        await self.app(scope, receive, _send)
+
+
+def _install_security_headers(app: Any, route_prefix: str) -> None:
+    """把最外层包一层 :class:`_SecurityHeaders`，给 BotUI 路由补上安全头。
+
+    不能用 ``app.add_middleware()`` —— 插件是在 lifespan startup 里挂载的，那时
+    ``middleware_stack`` 已构建好，``add_middleware`` 会直接抛
+    ``RuntimeError: Cannot add middleware after an application has started``。
+    所以这里直接把手上一层的 ``middleware_stack`` 换成包好它的新一层。
+    """
+    inner = getattr(app, 'middleware_stack', None)
+    app.middleware_stack = _SecurityHeaders(inner, route_prefix)

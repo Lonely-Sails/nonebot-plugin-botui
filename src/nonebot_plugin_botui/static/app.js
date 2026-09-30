@@ -769,6 +769,13 @@ function applyMeta() {
   // 用它初始化切换器；之后再靠 /bots 与 WebSocket 事件刷新。
   if (Array.isArray(meta.bot_list)) setBots(meta.bot_list);
 
+  // 控制台不该被搜索引擎收录：后端在 /meta 里给出 robots 指令，这里落到 <meta>
+  if (hasText(meta.robots_tag)) {
+    let tag = document.querySelector('meta[name="robots"]');
+    if (!tag) { tag = document.createElement('meta'); tag.setAttribute('name', 'robots'); document.head.appendChild(tag); }
+    tag.setAttribute('content', String(meta.robots_tag));
+  }
+
   document.title = (hasText(meta.name) ? String(meta.name) : 'BotUI') + ' · 消息控制台';
   renderConnMeta();
   if (!state.gateOpen) statusOk();

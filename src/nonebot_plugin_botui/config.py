@@ -44,6 +44,14 @@ class Config(BaseModel):
     """提示链接里使用的主机名（只影响链接显示，不影响服务实际监听地址）"""
     botui_allow_remote: bool = False
     """是否允许非本机来源访问。开启前请确保已启用令牌鉴权或放在反向代理之后"""
+    botui_allowed_hosts: tuple[str, ...] = ()
+    """允许的 ``Host`` 头（走反向代理用域名访问时填写）。
+
+    用来挡 DNS rebinding：浏览器访问 ``http://attacker.example`` 时，该域名可以
+    先解析到攻击者服务器、再重新解析到 ``127.0.0.1``，此时来源就成了环回，只
+    看来源会被放行。因此这里再校验 ``Host`` —— 本机主机名（``localhost`` /
+    环回 IP）始终允许，用域名访问就把域名写进来。``BOTUI_ALLOW_REMOTE=true``
+    时不再限制。"""
 
     # ── 鉴权 ────────────────────────────────────────────────────────────
     botui_auth: bool = True

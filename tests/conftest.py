@@ -123,6 +123,22 @@ def _alias_plugin_modules() -> None:
 
 
 @pytest.fixture(autouse=True)
+def reset_auth_throttle():
+    """清空鉴权失败限速，避免用例之间互相污染。
+
+    限速按来源 IP 计数，而所有用例共用同一个 ASGI 客户端，次数是累加的 ——
+    没有这道清理，前面「令牌错误」的用例会把后面用例的来源拉到 429。
+    """
+    module = sys.modules.get('src.nonebot_plugin_botui')
+    api = getattr(module, 'api', None)
+    if api is not None:
+        api._auth_throttle.clear()
+    yield
+    if api is not None:
+        api._auth_throttle.clear()
+
+
+@pytest.fixture(autouse=True)
 def clean_uninfo_cache():
     """uninfo 会缓存会话信息（默认 300 秒）。
 

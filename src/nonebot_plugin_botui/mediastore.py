@@ -73,6 +73,11 @@ _BUCKET_LEN = 2
 #: 可以（也值得）缓存到本地的消息段类型
 MEDIA_TYPES = frozenset({'image', 'file', 'voice', 'audio', 'video'})
 
+#: 待发送附件（系统临时区的内存索引）最多留几份。
+#: 防止认证用户在发送前反复上传，把临时目录撑大 —— 超出时按最旧优先丢弃
+#: （正文一并删掉），与 ``ttl`` 回收拍在同一处。
+MAX_PENDING = 64
+
 #: 引用前缀：聊天记录 / 已发出的消息
 _MSG_PREFIX = 'msg:'
 _MSGID_PREFIX = 'msgid:'
@@ -467,7 +472,19 @@ class MediaStore:
             path=path,
         )
         self._pending[uid] = item
+        await self._evict_pending()
         return item.to_record()
+
+    async def _evict_pending(self) -> int:
+        """待发送附件超出 :data:`MAX_PENDING` 时按最旧优先丢弃。"""
+        overflow = len(self._pending) - MAX_PENDING
+        if overflow <= 0:
+            return 0
+        oldest = sorted(self._pending.values(), key=lambda i: i.created)[:overflow]
+        for item in oldest:
+            self._pending.pop(item.id, None)
+            await asyncio.to_thread(item.path.unlink, True)
+        return overflow
 
     async def save(
         self,
