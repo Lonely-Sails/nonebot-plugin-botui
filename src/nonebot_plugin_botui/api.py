@@ -682,8 +682,10 @@ async def ws_events(websocket: WebSocket, since: int = Query(0, ge=0)) -> None:
         while True:
             try:
                 event = await asyncio.wait_for(queue.get(), timeout=WS_HEARTBEAT)
-            except TimeoutError:
-                # 心跳：既保活（挡掉中间代理的空闲断连），也顺便探一次连接
+            except (TimeoutError, asyncio.TimeoutError):
+                # 心跳：既保活（挡掉中间代理的空闲断连），也顺便探一次连接。
+                # 两个 TimeoutError 都要捕获：Python 3.11 之前 asyncio.TimeoutError
+                # 与内置 TimeoutError 不是同一个类，wait_for 抛的是前者。
                 event = {'type': 'ping', 'now': time.time()}
             await websocket.send_json(event)
 

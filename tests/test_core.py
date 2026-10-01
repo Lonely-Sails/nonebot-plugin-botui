@@ -514,7 +514,10 @@ def test_version_is_consistent_across_files():
     import re
     from pathlib import Path
 
-    import tomllib
+    try:
+        import tomllib
+    except ModuleNotFoundError:  # Python 3.10：标准库还没有 tomllib
+        import tomli as tomllib
 
     root = Path(__file__).parent.parent
     data = tomllib.loads((root / 'pyproject.toml').read_text(encoding='utf-8'))
