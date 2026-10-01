@@ -27,6 +27,11 @@ dev = [
   "nonebot2[fastapi] >= 2.3.0,<3.0.0",
   "poethepoet >= 0.42.1",
   "ruff >= 0.15.2,<1.0.0",
+  # basedpyright 按 [tool.pyright] pythonVersion=3.10 分析，但 CI 的静态检查
+  # job 用 3.12 跑 uv sync；3.12 下 pytest 等传递依赖不会装 tomli（marker
+  # python_full_version < '3.11'），于是 test_core.py 里的 `import tomli`
+  # 报 reportMissingImports。额外无条件装一份给静态检查用。
+  "tomli >= 2.0.0; python_version >= '3.11'",
   { include-group = "test" },
 ]
 test = [

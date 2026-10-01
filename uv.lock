@@ -1060,6 +1060,7 @@ dev = [
     { name = "pytest-cov" },
     { name = "pytest-xdist" },
     { name = "ruff" },
+    { name = "tomli", marker = "python_full_version >= '3.11'" },
 ]
 test = [
     { name = "nonebot-adapter-onebot" },
@@ -1096,6 +1097,7 @@ dev = [
     { name = "pytest-cov", specifier = ">=6.0.0" },
     { name = "pytest-xdist", specifier = ">=3.8.0,<4.0.0" },
     { name = "ruff", specifier = ">=0.15.2,<1.0.0" },
+    { name = "tomli", marker = "python_full_version >= '3.11'", specifier = ">=2.0.0" },
 ]
 test = [
     { name = "nonebot-adapter-onebot", specifier = ">=2.4.6,<3.0.0" },
