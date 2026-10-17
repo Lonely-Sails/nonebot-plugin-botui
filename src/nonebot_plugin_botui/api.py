@@ -41,7 +41,7 @@ if TYPE_CHECKING:
     from .webui import WebUIServer
     from .mediastore import MediaRecord
 
-VERSION = '0.1.0'
+VERSION = '0.1.1'
 
 # WebSocket 空闲心跳间隔（秒）：两层作用，一是挡掉反向代理的空闲断连，
 # 二是让服务端在下一次发送时发现已经断掉的连接。
