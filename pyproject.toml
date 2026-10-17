@@ -1,6 +1,6 @@
 [project]
 name = "nonebot-plugin-botui"
-version = "0.1.0"
+version = "0.1.1"
 description = "一个 QQ 风格的 WebUI 控制台：查看机器人收发的全部消息，并以机器人的身份发消息。"
 readme = "README.md"
 requires-python = ">= 3.10, < 4.0"
