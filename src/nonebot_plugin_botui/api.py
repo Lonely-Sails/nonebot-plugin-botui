@@ -1209,9 +1209,17 @@ async def post_recall(request: Request) -> dict[str, Any]:
 
 
 # ── 页面资源 ────────────────────────────────────────────────────────────
-@router.get('/static/{filename}')
+@router.get('/static/{filename:path}')
 async def get_static(filename: str) -> FileResponse:
-    if not filename or '/' in filename or '\\' in filename or filename.startswith('.'):
+    """静态资源。
+
+    允许子目录（表情图在 ``static/face/`` 下），但仍然只接受插件自己的
+    静态目录内的文件：``..``、绝对路径、``.`` 开头的隐藏文件一律拒绝。
+    """
+    parts = filename.replace('\\', '/').split('/')
+    if not parts or any(
+        part in ('', '.', '..') or part.startswith('.') for part in parts
+    ):
         raise HTTPException(status_code=400, detail='非法的资源名')
     path = (_static_dir / filename).resolve()
     if _static_dir.resolve() not in path.parents or not path.is_file():
@@ -1220,8 +1228,11 @@ async def get_static(filename: str) -> FileResponse:
         '.css': 'text/css; charset=utf-8',
         '.js': 'application/javascript; charset=utf-8',
         '.html': 'text/html; charset=utf-8',
+        '.json': 'application/json; charset=utf-8',
         '.svg': 'image/svg+xml',
         '.png': 'image/png',
+        '.webp': 'image/webp',
+        '.gif': 'image/gif',
         '.ico': 'image/x-icon',
     }.get(path.suffix.lower(), 'application/octet-stream')
     return FileResponse(path, media_type=media)

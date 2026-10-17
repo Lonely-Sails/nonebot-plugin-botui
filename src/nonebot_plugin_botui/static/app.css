@@ -735,6 +735,16 @@ html[data-theme="light"] .hit-text mark.hit { background: rgba(255, 200, 0, 0.42
 .msg.out .chip.seg-unknown { color: rgba(255, 255, 255, 0.72); }
 .chip.seg-reply::before { content: "↩"; font-size: 11px; opacity: 0.85; }
 .chip.seg-face::before { content: "☺"; font-size: 11px; opacity: 0.85; }
+/* QQ 小黄脸：内联小图，跟着文字基线走，不把气泡撑成图片块 */
+.seg-face-img {
+  width: 20px;
+  height: 20px;
+  margin: 0 1px;
+  vertical-align: -4px;
+  object-fit: contain;
+}
+/* 段里直接给的是 emoji 字符（非 QQ 编号）时原样显示 */
+.seg-emoji-char { font-size: 18px; line-height: 1; vertical-align: -2px; }
 .chip .chip-link { color: var(--accent); text-decoration: none; }
 .msg.out .chip .chip-link { color: #fff; text-decoration: underline; }
 .chip .chip-link:hover { text-decoration: underline; }

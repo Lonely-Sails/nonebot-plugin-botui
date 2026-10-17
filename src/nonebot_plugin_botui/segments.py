@@ -726,7 +726,9 @@ def _fallback_segments(message: Any) -> list[dict[str, Any]]:
                 )
             else:
                 out.append(_seg_media_dict(kind, url))
-        elif rtype == 'face':
+        elif rtype in ('face', 'emoji'):
+            # 官方 QQ 适配器把表情段叫作 emoji（data 里只有一个 id，就是小黄脸
+            # 编号）；OneBot V11 叫 face，两边用的是同一套编号，统一成 face。
             out.append(
                 {
                     'type': 'face',

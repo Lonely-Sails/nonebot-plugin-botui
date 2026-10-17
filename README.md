@@ -196,6 +196,7 @@ LOCALSTORE_PLUGIN_DATA_DIR={"nonebot_plugin_botui": "/srv/botui/data"}
 - **多机器人**：每个机器人（`self_id`）的会话彼此独立 —— 会话 key 采用 `self_id:kind_id` 的形式内嵌机器人 ID，同名群在 A、B 两个机器人下就是两条不同的会话；每条消息都带上产生它的适配器名与 `self_id`。WebUI 的发送只会用**会话自己的机器人**，它不在线时返回 503 而不会改用别的机器人。
 - 只要适配器支持对应的能力就能用：私聊/群聊识别、消息段解析、以及通过 alconna 的 exporter 发送消息。召回（撤回）需要该适配器在 alconna 里实现了对应的 exporter，不支持时网页会提示「适配器 xxx 不支持撤回」。
 - `BOTUI_EXCLUDE_ADAPTERS` 可以按适配器名（如 `["OneBot V12"]`）排除某些平台的记录。
+- **QQ 表情**：官方 QQ 适配器的 `emoji` 段只给一个编号（`data.id`，即 QQNT 的 emojiId），网页按这个编号显示表情图并带上中文名（如 `67 → 心碎`、`179 → doge`），图缺失时退回「[中文名]」文字标签。表情图与名称表随插件分发在 `static/face/`（327 张 64×64 WebP，约 600 KB + 运行时惰性加载的 `names.json`），素材取自 [QFace](https://koishi.js.org/QFace/)（MIT），按 QQNT 索引同步，与旧 QZone 编号不通用。
 
 ## 🧪 开发 / 测试
 
@@ -210,3 +211,5 @@ uv run poe bump patch    # 版本号变更（bump-my-version）
 ## 📄 协议
 
 MIT © 2026 Lonely-Sails
+
+内置的 QQ 表情素材（`static/face/`）来自 [QFace](https://koishi.js.org/QFace/)，遵循其 MIT 协议；表情形象版权归腾讯所有，仅用于本地展示消息中的表情。

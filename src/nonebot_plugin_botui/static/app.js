@@ -1793,7 +1793,7 @@ function buildBubble(segments) {
         bubble.appendChild(buildImage(seg));
         return;
       case 'face':
-        bubble.appendChild(h('span', 'chip seg-face', '[表情 ' + (hasText(seg.id) ? seg.id : '?') + ']'));
+        bubble.appendChild(buildFace(seg));
         return;
       case 'reply': {
         bubble.appendChild(buildQuote(seg));
@@ -2210,6 +2210,108 @@ function externalLink(href, text) {
   a.target = '_blank';
   a.rel = 'noopener noreferrer';
   return a;
+}
+
+/* ---------- QQ 表情 ----------
+ *
+ * 官方 QQ 适配器的 emoji 段只给一个编号（data.id），这个编号就是 QQNT 的
+ * emojiId。表情图与中文名随插件一起分发（static/face/），数据取自
+ * koishi.js.org/QFace（QQNT 索引，由 QQ 服务端定义同步而来），所以
+ * 「67 → 心碎」「179 → doge」这类映射是准的。
+ *
+ * 注意别再用旧的 QZone 表情地址（按 qzoneCode 拼出来的 gif 链接）：那套用的是
+ * QZone 编号（QFace 里的 qzoneCode），和适配器给的 emojiId 差了一整套映射，
+ * 直接拼会显示成完全不相干的表情。
+ */
+const FACE_DIR = ROOT_BASE + '/static/face/';
+const FACE_NAMES_URL = FACE_DIR + 'names.json';
+
+// id -> 中文名，从 names.json 惰性加载一次
+let faceNames = null;
+let faceNamesLoading = null;
+
+function loadFaceNames() {
+  if (faceNames) return Promise.resolve(faceNames);
+  if (faceNamesLoading) return faceNamesLoading;
+  faceNamesLoading = fetch(FACE_NAMES_URL, { cache: 'force-cache' })
+    .then((resp) => (resp.ok ? resp.json() : {}))
+    .then((data) => {
+      faceNames = data && typeof data === 'object' ? data : {};
+      return faceNames;
+    })
+    .catch(() => {
+      faceNames = {};
+      return faceNames;
+    });
+  return faceNamesLoading;
+}
+
+/** 表情的显示名（拿不到名称表时退回编号） */
+function faceLabel(seg) {
+  const id = hasText(seg && seg.id) ? String(seg.id).trim() : '';
+  // 适配器有时把编号塞进 name，那种 name 不是可读名
+  const raw = hasText(seg && seg.name) ? String(seg.name).trim() : '';
+  if (raw && !/^\d+$/.test(raw)) return raw;
+  if (id && faceNames && hasText(faceNames[id])) return String(faceNames[id]);
+  return id ? '表情 ' + id : '表情';
+}
+
+/**
+ * 表情图片地址。
+ *
+ * 优先用段里自带的 url（部分适配器直接把表情图放进来），其次就是本插件
+ * 随包分发的 static/face/<id>.webp。编号不像表情时返回空串。
+ */
+function faceImageUrl(seg) {
+  const own = safeUrl(seg && seg.url);
+  if (own) return own;
+  const id = hasText(seg && seg.id) ? String(seg.id).trim() : '';
+  if (!/^\d{1,4}$/.test(id)) return '';
+  return FACE_DIR + Number(id) + '.webp';
+}
+
+/**
+ * 表情段。
+ *
+ * 早先这里直接渲染成「[表情 67]」——官方适配器只给编号，界面上就只剩一串数字。
+ * 现在按编号显示本地表情图；图片缺失（新表情 / 老编号）或加载失败时，退回
+ * 「[中文名]」文字标签，至少能看出是哪个表情。
+ */
+function buildFace(seg) {
+  const id = hasText(seg && seg.id) ? String(seg.id).trim() : '';
+  const numeric = /^\d+$/.test(id);
+  const label = faceLabel(seg);
+  const textFallback = () => h('span', 'chip seg-face', '[' + label + ']');
+
+  // 编号本身就是字符（部分平台直接把 emoji 字符放进 id）时原样显示，
+  // 但段里若另外给了图片，仍以图片为准
+  if (id && !numeric && !safeUrl(seg.url)) return h('span', 'seg-emoji-char', id);
+
+  const url = faceImageUrl(seg);
+  if (!url) return textFallback();
+
+  const img = document.createElement('img');
+  img.className = 'seg-face-img';
+  img.loading = 'lazy';
+  img.decoding = 'async';
+  img.referrerPolicy = 'no-referrer';
+  img.alt = label;
+  img.title = label;
+  img.src = url;
+  img.addEventListener('error', () => {
+    if (!img.parentNode) return;
+    // 图没下载到就先看一眼名称表，拿到中文名再退化，比直接显示编号友好
+    const swap = () => {
+      if (!img.parentNode) return;
+      img.parentNode.replaceChild(
+        id && !numeric ? h('span', 'seg-emoji-char', id) : textFallback(),
+        img
+      );
+    };
+    if (faceNames) swap();
+    else loadFaceNames().then(swap);
+  });
+  return img;
 }
 
 function buildImage(seg) {
