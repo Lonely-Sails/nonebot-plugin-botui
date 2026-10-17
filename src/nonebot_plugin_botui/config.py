@@ -3,7 +3,8 @@
 from __future__ import annotations
 
 from nonebot import get_driver, get_plugin_config
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel
+from nonebot.compat import field_validator
 
 # 机器人发送消息时可能调用的 API 名称（用于区分“发出”的消息）
 SEND_APIS: frozenset[str] = frozenset(
