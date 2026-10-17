@@ -312,6 +312,19 @@ def test_parse_forward_nodes_handles_garbage():
     assert parse_forward_nodes({'unexpected': 'shape'}) == []
 
 
+def test_fallback_segments_accepts_qq_emoji_segment():
+    """官方 QQ 适配器的表情段叫 ``emoji``，兜底路径同样要认。
+
+    新版适配器（1.7.x）里没有 ``face`` 段，表情走 ``Emoji("emoji", {"id": "67"})``，
+    ``id`` 就是 QQ 小黄脸编号。以前只认 ``face``，这类段会落到「未知段」分支，
+    WebUI 上什么都看不到。
+    """
+    from nonebot_plugin_botui.segments import _fallback_segments
+
+    out = _fallback_segments({'type': 'emoji', 'data': {'id': '67'}})
+    assert out == [{'type': 'face', 'id': '67', 'name': ''}]
+
+
 def test_fallback_segments_accepts_dict_segments():
     """兜底路径要同时认适配器段对象与纯 dict（call_api 结果常是 dict）。"""
     from nonebot_plugin_botui.segments import _fallback_segments

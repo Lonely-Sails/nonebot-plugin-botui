@@ -158,8 +158,61 @@ async def test_static_assets_are_served(client: AsyncClient):
         assert ctype in resp.headers['content-type'], name
 
 
+async def test_static_serves_face_subdirectory(client: AsyncClient):
+    """表情图在 ``static/face/`` 子目录下，必须能正常取到。"""
+    resp = await client.get('/botui/static/face/67.webp')
+    assert resp.status_code == 200
+    assert 'image/webp' in resp.headers['content-type']
+
+    names = await client.get('/botui/static/face/names.json')
+    assert names.status_code == 200
+    assert 'json' in names.headers['content-type']
+    # 67 是「心碎」——官方适配器给的 emojiId 就是 QQNT 编号
+    assert names.json()['67'] == '心碎'
+
+
+async def test_face_assets_cover_known_emoji():
+    """表情素材要与名称表对得上，且涵盖常用编号。
+
+    数据取自 koishi.js.org/QFace 的 QQNT 索引：适配器的 emoji 段给的就是
+    这套编号（67 = 心碎、179 = doge），不能拿旧 QZone 编号去拼。
+    """
+    import json
+    from pathlib import Path
+
+    face_dir = (
+        Path(__file__).parent.parent
+        / 'src'
+        / 'nonebot_plugin_botui'
+        / 'static'
+        / 'face'
+    )
+    names = json.loads((face_dir / 'names.json').read_text(encoding='utf-8'))
+
+    for eid, name in (('0', '惊讶'), ('13', '呲牙'), ('67', '心碎'), ('179', 'doge')):
+        assert names.get(eid) == name, eid
+        assert (face_dir / f'{eid}.webp').is_file(), eid
+
+    # 有图的编号必须是名称表里有的，避免多出无主文件
+    for png in face_dir.glob('*.webp'):
+        assert png.stem in names, png.name
+
+
 async def test_static_rejects_path_traversal(client: AsyncClient):
-    for name in ('..%2F..%2Fpyproject.toml', '.env', 'nope.js'):
+    """静态资源只认插件自己目录里的文件。
+
+    这里必须用编码过的 ``%2E%2E``：明文 ``face/../app.js`` 会在 HTTP 客户端/
+    服务器规范化成 ``/botui/static/app.js``，压根到不了路由，测不出东西。
+    """
+    for name in (
+        '..%2F..%2Fpyproject.toml',
+        '%2E%2E/%2E%2E/pyproject.toml',
+        'face/%2E%2E/app.js',
+        'face/%2e%2e%2fapp.js',
+        '.env',
+        'nope.js',
+        'face/',
+    ):
         resp = await client.get(f'/botui/static/{name}')
         assert resp.status_code in (400, 404), name
 
@@ -196,6 +249,33 @@ async def test_frontend_reads_page_size_from_meta():
     assert more_lines, '没找到 hasMore 的比较，测试需要更新'
     for line in more_lines:
         assert 'PAGE_LIMIT_FALLBACK' not in line, f'分页比较写死了：{line.strip()}'
+
+
+async def test_frontend_renders_face_as_image():
+    """表情不能只显示编号。
+
+    官方 QQ 适配器的 ``emoji`` 段只给一个编号（``67``），早先前端直接渲染成
+    「[表情 67]」。这里锁住：编号要指向随包分发的本地表情图，且名称、回退
+    都走同一套逻辑。
+    """
+    from pathlib import Path
+
+    source = (
+        Path(__file__).parent.parent
+        / 'src'
+        / 'nonebot_plugin_botui'
+        / 'static'
+        / 'app.js'
+    ).read_text(encoding='utf-8')
+
+    assert 'static/face/' in source, '表情图要取插件自带的 static/face/'
+    assert 'names.json' in source, '表情名要取 names.json'
+    assert "case 'face':" in source
+    assert 'buildFace(seg)' in source, 'face 段要交给 buildFace 渲染'
+    assert "'[表情 ' + " not in source, '不要再把表情渲染成带编号的纯文本'
+    # 旧的 QZone 编号（QFace 里的 qzoneCode）与 QQNT 编号不是一套，按 id 硬拼
+    # 远程地址会显示成完全不相干的表情，所以不能出现拼远程表情 URL 的代码
+    assert 'qzone/em/e' not in source, '不要用旧 QZone 编号拼表情地址'
 
 
 async def test_favicon_is_empty(client: AsyncClient):
